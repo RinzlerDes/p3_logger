@@ -1,0 +1,10 @@
+{
+  "source": {
+    "sourceType": "STM32CubeMX"
+  },
+  "board": "STM32WB5MM-DK",
+  "device": "STM32WB5MMGH6",
+  "core": "Cortex-M4",
+  "order": 0,
+  "toolchain": "GCC"
+}
