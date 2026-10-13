@@ -188,8 +188,14 @@ void app_start(void)
                                      .priority = osPriorityLow };
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u,
                                      .priority = osPriorityLow };
-    osThreadNew(HeartbeatTask, NULL, &hb_attr);
-    osThreadNew(UITask,        NULL, &ui_attr);
+    // osThreadNew(HeartbeatTask, NULL, &hb_attr);
+    // osThreadNew(UITask,        NULL, &ui_attr);
+
+    osThreadId_t hb = osThreadNew(HeartbeatTask, NULL, &hb_attr);
+    osThreadId_t ui = osThreadNew(UITask, NULL, &ui_attr);
+
+    printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
+    printf("UI task: %s\n", ui ? "OK" : "FAILED");
 }
 
 /* ==================== ISR -> task handoff (spec R4/R10) =================== */
