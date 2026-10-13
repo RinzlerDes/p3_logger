@@ -120,7 +120,6 @@ int main(void)
   MX_SPI1_Init();
   MX_TSC_Init();
   MX_QUADSPI_Init();
-
   /* USER CODE BEGIN 2 */
   app_post();
   /* USER CODE END 2 */

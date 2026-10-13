@@ -2,9 +2,10 @@
 CAD.formats=
 CAD.pinconfig=
 CAD.provider=
-FREERTOS.IPParameters=Tasks01,configUSE_IDLE_HOOK,configCHECK_FOR_STACK_OVERFLOW
+FREERTOS.IPParameters=Tasks01,configUSE_IDLE_HOOK,configCHECK_FOR_STACK_OVERFLOW,configTOTAL_HEAP_SIZE
 FREERTOS.Tasks01=defaultTask,24,128,StartDefaultTask,Default,NULL,Dynamic,NULL,NULL
 FREERTOS.configCHECK_FOR_STACK_OVERFLOW=2
+FREERTOS.configTOTAL_HEAP_SIZE=32768
 FREERTOS.configUSE_IDLE_HOOK=1
 File.Version=6
 GPIO.groupedBy=Group By Peripherals

@@ -194,8 +194,8 @@ void app_start(void)
     osThreadId_t hb = osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadId_t ui = osThreadNew(UITask, NULL, &ui_attr);
 
-    printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
-    printf("UI task: %s\n", ui ? "OK" : "FAILED");
+    // printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
+    // printf("UI task: %s\n", ui ? "OK" : "FAILED");
 }
 
 /* ==================== ISR -> task handoff (spec R4/R10) =================== */
