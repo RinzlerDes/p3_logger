@@ -1,3 +1,4 @@
+#include <stdio.h>
 /**
  ******************************************************************************
  * @file    vl53l0x.c
@@ -78,8 +79,12 @@ int32_t VL53L0X_ReadRangeSingle(VL53L0X_Object_t *obj, uint16_t *range_mm)
     do {
         if (rd(obj, REG_RESULT_INTERRUPT_STATUS, &st, 1u) != VL53L0X_OK)
             return VL53L0X_ERR;
-        if ((HAL_GetTick() - t0) > RANGE_POLL_TMO_MS)
+        if ((HAL_GetTick() - t0) > RANGE_POLL_TMO_MS) {
+                printf("ToF timeout: status=0x%02X, elapsed=%lu ms\n",
+               (unsigned)st,
+               (unsigned long)(HAL_GetTick() - t0));
             return VL53L0X_ERR_TIMEOUT;
+        }
     } while ((st & 0x07u) == 0u);
 
     /* 3) read the 16-bit range (big-endian) at RESULT_RANGE_STATUS + 10 */
