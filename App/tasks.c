@@ -207,7 +207,7 @@ static void vitals_sample_task() {
 
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
         uint32_t now = HAL_GetTick();
-        temp_result = STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
+        temp_result  = STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
         // always times out
         // tof_result = VL53L0X_ReadRangeSingle(&tof, &distance);
         osMutexRelease(i2c3MutexHandle);
@@ -241,13 +241,13 @@ static void vitals_sample_task() {
     }
 }
 
-static void imu_task(void) {
+static void imu_task() {
     for (;;) {
         osSemaphoreAcquire(imuDrdySemHandle, osWaitForever);
         ISM330DHCX_Axes_t a;
 
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        uint32_t now = HAL_GetTick();
+        uint32_t now   = HAL_GetTick();
         int32_t result = ISM330DHCX_ACC_GetAxes(&imu, &a);
         osMutexRelease(i2c3MutexHandle);
 
@@ -296,27 +296,6 @@ static void imu_task(void) {
     }
 }
 
-// static void vitals_sample_task() {
-//     uint32_t tick   = osKernelGetTickCount();
-//     uint32_t period = osKernelGetTickFreq();
-//     // float temp = 0.0f;
-
-//     for (;;) {
-//         tick += period;
-//         osDelayUntil(tick);
-//         // printf("vitals sample task\n");
-
-//         osMutexAcquire(i2c3MutexHandle, osWaitForever);
-//         // STTS22H_TEMP_GetTemperature(&temp_sensor, &g_vitals.temp);
-//         int32_t res = VL53L0X_ReadRangeSingle(&tof, &g_vitals.distance_mm);
-//         osMutexRelease(i2c3MutexHandle);
-
-//         printf("temp: %lu, distance mm: %lu\n",
-//                (uint32_t)(g_vitals.temp * 10),
-//                g_vitals.distance_mm);
-//     }
-// }
-
 /* ============================ app_start ================================== */
 
 void app_start(void) {
@@ -344,17 +323,18 @@ void app_start(void) {
     /* --- smoke-test tasks (REPLACE with the logger — see block below) --- */
     const osThreadAttr_t hb_attr = { .name = "hb", .stack_size = 512u, .priority = osPriorityLow };
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u, .priority = osPriorityLow };
-    // osThreadNew(HeartbeatTask, NULL, &hb_attr);
-    // osThreadNew(UITask,        NULL, &ui_attr);
-
     const osThreadAttr_t vitals_sample_attr = { .name       = "vitals_sample",
                                                 .stack_size = 2048u,
                                                 .priority   = osPriorityNormal };
+    const osThreadAttr_t imu_attr           = { .name       = "imu",
+                                                .stack_size = 2048u,
+                                                .priority   = osPriorityAboveNormal };
 
     osThreadId_t hb = osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadId_t ui = osThreadNew(UITask, NULL, &ui_attr);
     osThreadId_t vitals_sample_thread_id =
         osThreadNew(vitals_sample_task, NULL, &vitals_sample_attr);
+    osThreadId_t imu_thread_id = osThreadNew(imu_task, NULL, &imu_attr);
 
     // printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
     // printf("UI task: %s\n", ui ? "OK" : "FAILED");

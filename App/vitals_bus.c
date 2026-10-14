@@ -90,6 +90,18 @@ int32_t vitals_bus_init(void)
         printf("POST: ISM330DHCX  config FAILED\n");
         return -2;
     }
+    int32_t status = ISM330DHCX_ACC_Enable_DRDY_On_INT1(&imu);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to enable interrupt on imu\n");
+        return -1;
+    }
+
+    status = ISM330DHCX_DRDY_Set_Mode(&imu, ISM330DHCX_DRDY_PULSED);
+    if (status != ISM330DHCX_OK) {
+        printf("Failed to set pulsed DRDY ISM330DHCX\n");
+        return -1;
+    }
+
     printf("POST: ISM330DHCX  OK  WHO_AM_I=0x%02X\n", id);
 
     /* ---- VL53L0X: time-of-flight (NON-FATAL — see vitals_bus.h) --------- */
