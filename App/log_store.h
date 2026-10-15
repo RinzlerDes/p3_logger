@@ -53,6 +53,7 @@ typedef struct {
 #define LOG_OK          0
 #define LOG_ERR        -1
 #define LOG_FULL       -2
+#define LOG_CRC_ERR    -3
 
 /** CRC-16/CCITT (poly 0x1021, init 0xFFFF) over len bytes. Provided so your
  *  writer and the DOWNLOAD reader agree bit-for-bit. */
@@ -80,5 +81,8 @@ int32_t log_read_record(uint32_t index, log_record_t *out);
 
 /** Snapshot the log status for STATUS / the OLED LOG page. */
 void log_store_status(log_status_t *out);
+
+// @retval LOG_OK, LOG_FULL (spec R21), LOG_ERR.
+int32_t log_flush();
 
 #endif /* LOG_STORE_H */

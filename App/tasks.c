@@ -41,22 +41,23 @@
 #include "vl53l0x.h"
 
 typedef struct {
-    float temp;
+    float    temp;
     uint16_t distance_mm;
 } vitals_t;
 
 extern QSPI_HandleTypeDef hqspi; /* CubeMX-generated once QUADSPI is on   */
 
 /* ---- shared RTOS handles (declared extern in tasks.h / log_store.c) --------*/
-osMutexId_t flashMutexHandle;
-osMutexId_t i2c3MutexHandle;
+osMutexId_t        flashMutexHandle;
+osMutexId_t        i2c3MutexHandle;
 osMessageQueueId_t vitalsQueueHandle;
-osSemaphoreId_t imuDrdySemHandle;
+osSemaphoreId_t    imuDrdySemHandle;
 
+// vitals task
 static vitals_t g_vitals;
 static uint32_t g_vitals_queue_drops;
 
-/* angles (deci-degrees, calibrated) */
+// imu task
 typedef enum {
     POSTURE_UNKNOWN = 0,
     POSTURE_UPRIGHT,
@@ -70,7 +71,8 @@ static int32_t cal_incline_ddeg, cal_roll_ddeg; /* CAL offsets (R6)   */
 // static uint8_t  imu_valid;
 static uint32_t g_axes_failed_count;
 
-// QueueHandle_t vitals_mailbox;
+// logger task
+static uint32_t g_logger_errors;
 
 /* ============================ POST (pre-scheduler) ======================== */
 void app_post(void) {
@@ -193,17 +195,17 @@ static void UITask(void* arg) {
 }
 
 static void vitals_sample_task() {
-    uint32_t tick         = osKernelGetTickCount();
+    uint32_t       tick   = osKernelGetTickCount();
     const uint32_t period = osKernelGetTickFreq();
 
     for (;;) {
         tick += period;
         osDelayUntil(tick);
 
-        uint16_t distance   = 0u;
-        int32_t tof_result  = VL53L0X_ERR;
-        int32_t temp_result = STTS22H_ERROR;
-        float temp;
+        uint16_t distance    = 0u;
+        int32_t  tof_result  = VL53L0X_ERR;
+        int32_t  temp_result = STTS22H_ERROR;
+        float    temp;
 
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
         uint32_t now = HAL_GetTick();
@@ -225,7 +227,7 @@ static void vitals_sample_task() {
         if (temp_result == STTS22H_OK) {
             g_vitals.temp = temp;
 
-            int16_t temp_deci          = (int16_t)lroundf(g_vitals.temp * 10);
+            int16_t  temp_deci         = (int16_t)lroundf(g_vitals.temp * 10);
             uint16_t temp_deci_encoded = (uint16_t)temp_deci;
 
             record.payload[0] = temp_deci_encoded & 0xffu;
@@ -247,8 +249,8 @@ static void imu_task() {
         ISM330DHCX_Axes_t a;
 
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        uint32_t now   = HAL_GetTick();
-        int32_t result = ISM330DHCX_ACC_GetAxes(&imu, &a);
+        uint32_t now    = HAL_GetTick();
+        int32_t  result = ISM330DHCX_ACC_GetAxes(&imu, &a);
         osMutexRelease(i2c3MutexHandle);
 
         log_record_t record = { .timestamp_ms = now, .channel = LOG_CH_IMU, .flags = LOG_F_FAULT };
@@ -261,11 +263,11 @@ static void imu_task() {
             goto cleanup;
         }
 
-        float inc            = atan2f(-a.x, sqrtf(a.y * a.y + a.z * a.z)) * 573.0f; /* 0.1° */
-        float roll           = atan2f(a.y, a.z) * 573.0f;
-        int32_t incline_ddeg = (int32_t)inc - cal_incline_ddeg;
-        int32_t roll_ddeg    = (int32_t)roll - cal_roll_ddeg;
-        posture_t posture    = POSTURE_UNKNOWN;
+        float     inc          = atan2f(-a.x, sqrtf(a.y * a.y + a.z * a.z)) * 573.0f; /* 0.1° */
+        float     roll         = atan2f(a.y, a.z) * 573.0f;
+        int32_t   incline_ddeg = (int32_t)inc - cal_incline_ddeg;
+        int32_t   roll_ddeg    = (int32_t)roll - cal_roll_ddeg;
+        posture_t posture      = POSTURE_UNKNOWN;
 
         if (incline_ddeg > 300) {
             posture = POSTURE_UPRIGHT;
@@ -292,6 +294,34 @@ static void imu_task() {
         int32_t status = osMessageQueuePut(vitalsQueueHandle, &record, 0, 0);
         if (status != osOK) {
             g_vitals_queue_drops++;
+        }
+    }
+}
+
+static void logger_task() {
+    const uint32_t timeout = osKernelGetTickFreq() * 2;
+    for (;;) {
+        log_record_t record;
+        int32_t      result;
+        osStatus_t   status = osMessageQueueGet(vitalsQueueHandle, &record, NULL, timeout);
+
+        if (status == osOK) {
+            result = log_append(&record);
+            if (result != LOG_OK && result != LOG_FULL) {
+                // TODO
+                g_logger_errors++;
+                continue;
+            }
+        } else if (status == osErrorTimeout) {
+            result = log_flush();
+            if (result != LOG_OK && result != LOG_FULL) {
+                g_logger_errors++;
+                continue;
+            }
+        } else {
+            // TODO
+            g_logger_errors++;
+            continue;
         }
     }
 }
@@ -329,12 +359,16 @@ void app_start(void) {
     const osThreadAttr_t imu_attr           = { .name       = "imu",
                                                 .stack_size = 2048u,
                                                 .priority   = osPriorityAboveNormal };
+    const osThreadAttr_t logger_attr        = { .name       = "logger",
+                                                .stack_size = 2048u,
+                                                .priority   = osPriorityNormal };
 
     osThreadId_t hb = osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadId_t ui = osThreadNew(UITask, NULL, &ui_attr);
     osThreadId_t vitals_sample_thread_id =
         osThreadNew(vitals_sample_task, NULL, &vitals_sample_attr);
-    osThreadId_t imu_thread_id = osThreadNew(imu_task, NULL, &imu_attr);
+    osThreadId_t imu_thread_id    = osThreadNew(imu_task, NULL, &imu_attr);
+    osThreadId_t logger_thread_id = osThreadNew(logger_task, NULL, &logger_attr);
 
     // printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
     // printf("UI task: %s\n", ui ? "OK" : "FAILED");
