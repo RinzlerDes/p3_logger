@@ -20,9 +20,10 @@
 #include "s25fl128s.h"
 
 /* ---- Flash layout (demo-scaled small so LOG FULL is reachable — R21/§7.3) -*/
-#define HEADER_ADDR      0x000000u /* one 4-KB parameter sector   */
-#define DATA_BASE        0x010000u /* first 64-KB uniform sector  */
-#define DATA_SECTORS     2u        /* 2 x 64 KB = 128 KB          */
+#define HEADER_ADDR 0x000000u /* one 4-KB parameter sector   */
+// #define DATA_BASE        0x010000u /* first 64-KB uniform sector  */
+#define DATA_BASE        0x020000u
+#define DATA_SECTORS     2u /* 2 x 64 KB = 128 KB          */
 #define DATA_SIZE        (DATA_SECTORS * S25FL128S_SECTOR_64K)
 #define CAPACITY_RECORDS (DATA_SIZE / sizeof(log_record_t)) /* 8192 records  */
 
@@ -146,8 +147,9 @@ int32_t log_format(void) {
     /* Erase the header and all data sectors. Each erase blocks for up to
      * about 650 ms. That cost is the cause of the CONFIG-only,
      * operator-announced FORMAT command. */
-    if (S25FL128S_EraseSector4K(HEADER_ADDR) != S25FL128S_OK) rc = LOG_ERR;
-    for (uint32_t i = 0; rc == LOG_OK && i < DATA_SECTORS; i++) {
+    int32_t rc_header = LOG_OK;
+    if (S25FL128S_EraseSector4K(HEADER_ADDR) != S25FL128S_OK) rc_header = LOG_ERR;
+    for (uint32_t i = 0; rc_header == LOG_OK && i < DATA_SECTORS; i++) {
         if (S25FL128S_EraseSector64K(DATA_BASE + i * S25FL128S_SECTOR_64K) != S25FL128S_OK)
             rc = LOG_ERR;
     }
@@ -205,7 +207,7 @@ int32_t log_flush() {
     }
     if (s_header_count >= HDR_SLOT_COUNT) {
         // goto cleanup_s_page_fill;
-        return LOG_ERR;
+        return LOG_HEADER_FULL;
     }
 
     flash_lock();
@@ -229,7 +231,7 @@ int32_t log_flush() {
                             .write_off    = s_write_off,
                             .record_count = s_count,
                             .log_full     = s_full };
-    uint16_t      crc    = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
+    uint16_t     crc    = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
     header.crc16        = crc;
 
     flash_lock();
@@ -272,7 +274,8 @@ int32_t log_append(const log_record_t* rec) {
     }
     if (s_header_count >= HDR_SLOT_COUNT) {
         // goto cleanup_s_page_fill;
-        return LOG_ERR;
+        s_overflow++;
+        return LOG_HEADER_FULL;
     }
 
     log_record_t record = *rec;
@@ -294,7 +297,6 @@ int32_t log_append(const log_record_t* rec) {
 
     return LOG_OK;
 }
-
 
 /* ---- read-back for DOWNLOAD: STUDENT TODO --------------------------------*/
 int32_t log_read_record(uint32_t index, log_record_t* out) {

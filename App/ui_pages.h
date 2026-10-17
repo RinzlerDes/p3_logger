@@ -54,6 +54,15 @@ typedef struct {
     uint8_t  cpu_percent;  /* idle-hook %CPU (R28)                           */
 } ui_live_t;
 
+typedef struct {
+    uint32_t imu_stack;
+    uint32_t vitals_stack;
+    uint32_t logger_stack;
+    uint32_t ui_stack;
+    uint32_t queue_depth;
+    uint32_t queue_high_water_mark;
+} ui_tasks_t;
+
 /** Current page. */
 ui_page_t ui_pages_current(void);
 
@@ -63,6 +72,6 @@ ui_page_t ui_pages_next(void);
 /** Draw the CURRENT page. `live` feeds the LIVE page and must not be NULL.
  *  The LOG page reads log_store_status() itself. Call this function from
  *  your UI task only, because the OLED belongs to that task (§5.3). */
-void ui_pages_render(const ui_live_t *live);
+void ui_pages_render(const ui_live_t *live, const ui_tasks_t* tasks);
 
 #endif /* UI_PAGES_H */

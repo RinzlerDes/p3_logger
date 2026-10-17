@@ -156,6 +156,7 @@ static int32_t erase_at(uint32_t instruction, uint32_t addr, uint32_t tmo_ms)
 int32_t S25FL128S_EraseSector4K(uint32_t addr)
 {
     return erase_at(CMD_P4E, addr, 1000u);   /* 4K/64K erase max ~650 ms       */
+    // return erase_at(CMD_P4E, addr, 5000u);   /* 4K/64K erase max ~650 ms       */
 }
 
 int32_t S25FL128S_EraseSector64K(uint32_t addr)

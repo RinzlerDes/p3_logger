@@ -35,15 +35,11 @@
 #include "rgb_led.h"
 #include "s25fl128s.h"
 #include "stm32wbxx_hal.h"
+#include "stm32wbxx_hal_gpio.h"
 #include "stts22h.h"
 #include "ui_pages.h"
 #include "vitals_bus.h"
 #include "vl53l0x.h"
-
-typedef struct {
-    float    temp;
-    uint16_t distance_mm;
-} vitals_t;
 
 extern QSPI_HandleTypeDef hqspi; /* CubeMX-generated once QUADSPI is on   */
 
@@ -54,25 +50,41 @@ osMessageQueueId_t vitalsQueueHandle;
 osSemaphoreId_t    imuDrdySemHandle;
 
 // vitals task
-static vitals_t g_vitals;
-static uint32_t g_vitals_queue_drops;
+typedef struct {
+    float    temp;
+    uint16_t distance_mm;
+} vitals_t;
+static vitals_t s_vitals;
+static uint32_t s_vitals_queue_drops;
+static uint8_t  s_temp_fault;
+static uint8_t  s_tof_fault = 1;
 
 // imu task
-typedef enum {
-    POSTURE_UNKNOWN = 0,
-    POSTURE_UPRIGHT,
-    POSTURE_SUPINE,
-    POSTURE_LEFT,
-    POSTURE_RIGHT,
-    POSTURE_PRONE
-} posture_t;
-static int32_t incline_ddeg, roll_ddeg;
+// static int32_t incline_ddeg, roll_ddeg;
 static int32_t cal_incline_ddeg, cal_roll_ddeg; /* CAL offsets (R6)   */
 // static uint8_t  imu_valid;
-static uint32_t g_axes_failed_count;
+static uint32_t     s_axes_failed_count;
+static uint8_t      s_imu_fault;
+static ui_posture_t s_posture = UI_POSTURE_UNKNOWN;
 
 // logger task
-static uint32_t g_logger_errors;
+static uint32_t s_logger_errors;
+static uint8_t  s_logger_fault;
+
+// ui task
+static uint8_t volatile s_ui_next_page;
+
+// all
+static uint32_t s_vitals_queue_high_water_mark;
+// static uint32_t s_vitals_queue_depth;
+osThreadId_t s_ui_thread_id;
+osThreadId_t s_vitals_thread_id;
+osThreadId_t s_imu_thread_id;
+osThreadId_t s_logger_thread_id;
+
+typedef enum { APP_CONFIG, APP_RUN } app_mode_t;
+
+static app_mode_t s_app_mode = APP_CONFIG;
 
 /* ============================ POST (pre-scheduler) ======================== */
 void app_post(void) {
@@ -121,9 +133,108 @@ static void cmd_help(int argc, char* argv[]) {
     cmd_table_help();
 }
 
+static void cmd_status(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
+    log_status_t st;
+    log_store_status(&st);
+
+    uint32_t uptime   = HAL_GetTick() / 1000u;
+    uint32_t coverage = st.capacity_records
+                            ? (uint32_t)((uint64_t)st.record_count * 100u / st.capacity_records)
+                            : 0u;
+
+    int16_t temp_dC    = (int16_t)(s_vitals.temp * 10.0f);
+    int     temp_whole = temp_dC / 10;
+    int     temp_frac  = (temp_dC < 0 ? -temp_dC : temp_dC) % 10;
+
+    char* app_mode;
+    if (s_app_mode == APP_CONFIG) {
+        app_mode = "CONFIG";
+    }
+    if (s_app_mode == APP_RUN) {
+        app_mode = "RUN";
+    }
+
+    printf("\n=== AL-24 STATUS ===\n");
+    printf("Mode:    %s\n", app_mode);
+    printf("Uptime:  %lu s\n", uptime);
+
+    if (s_temp_fault) {
+        printf("Temp:    FAULT\n");
+    } else {
+        printf("Temp:    %d.%d C\n", temp_whole, temp_frac);
+    }
+    if (s_imu_fault) {
+        printf("IMU:     FAULT\n");
+    } else {
+        printf("IMU:     %s\n", ui_posture_name(s_posture));
+    }
+    if (s_tof_fault) {
+        printf("Prox:    FAULT\n");
+    } else {
+        printf("Prox:    %u mm\n", (unsigned)s_vitals.distance_mm);
+    }
+
+    printf("Records: %lu/%lu (%lu%%)\n", st.record_count, st.capacity_records, coverage);
+
+    printf("Log:     %s, overflow=%lu\n", st.log_full ? "FULL" : "OK", st.overflow_count);
+
+    printf("Queue:   %lu/16, high_water_mark=%lu, drops=%lu\n",
+           osMessageQueueGetCount(vitalsQueueHandle),
+           s_vitals_queue_high_water_mark,
+           s_vitals_queue_drops);
+
+    printf("Stack min free (words):\n");
+    printf("IMU=%lu\n", osThreadGetStackSpace(s_imu_thread_id) / 4);
+    printf("Vitals=%lu\n", osThreadGetStackSpace(s_vitals_thread_id) / 4);
+    printf("Logger=%lu\n", osThreadGetStackSpace(s_logger_thread_id) / 4);
+    printf("UI=%lu\n", osThreadGetStackSpace(s_ui_thread_id) / 4);
+
+    printf("CPU:     %u%%\n", (unsigned)perf_cpu_percent());
+}
+
+static const char* app_mode_name(void) { return s_app_mode == APP_RUN ? "RUN" : "CONFIG"; }
+
+static void cmd_mode(int argc, char* argv[]) {
+    if (argc != 2) {
+        printf("Usage: MODE RUN|CONFIG\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "RUN") == 0) {
+        s_app_mode = APP_RUN;
+    } else if (strcmp(argv[1], "CONFIG") == 0) {
+        s_app_mode = APP_CONFIG;
+    } else {
+        printf("Invalid mode. Use RUN or CONFIG.\r\n");
+        return;
+    }
+
+    printf("Mode set to %s\r\n", app_mode_name());
+}
+
+static void cmd_format() {
+    if (s_app_mode != APP_CONFIG) {
+        printf("Can only format in MODE CONFIG\n");
+        return;
+    }
+
+    int32_t result = log_format();
+    if (result == LOG_OK) {
+        printf("Log formatted\n");
+    } else {
+        printf("Failed to format log\n");
+    }
+}
+
 static const cmd_entry_t s_cmds[] = {
-    { "HELP", cmd_help, "list commands" },
     /* STUDENT TODO: STATUS, MODE, SET, FORMAT, DOWNLOAD, CPU ... (R25) */
+    { "HELP", cmd_help, "list commands" },
+    { "STATUS", cmd_status, "app status" },
+    { "MODE", cmd_mode, "set app mode" },
+    { "FORMAT", cmd_format, "format/wipe log" },
 };
 
 /* ============================ smoke-test tasks ============================ */
@@ -139,7 +250,7 @@ static void HeartbeatTask(void* arg) {
     uint32_t on = 0u;
     for (;;) {
         on ^= 1u;
-        rgb_set(0u, on ? 12u : 0u, 0u);
+        rgb_set(0u, on ? 3u : 0u, 0u);
         osDelay(500u);
     }
 }
@@ -158,43 +269,69 @@ static void UITask(void* arg) {
         tick += 50u;
         osDelayUntil(tick);
 
+        if (s_ui_next_page) {
+            s_ui_next_page = 0;
+            ui_pages_next();
+        }
+
         cmd_table_poll(); /* non-blocking console service   */
 
         if (++sub >= 20u) { /* ~1 s                           */
             sub = 0u;
             perf_mon_tick_1s();
 
-            float tc = 0.0f; /* live temp under the bus mutex  */
+            // float tc = 0.0f; /* live temp under the bus mutex  */
             // osMutexAcquire(i2c3MutexHandle, osWaitForever);
             // (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
             // osMutexRelease(i2c3MutexHandle);
             // int td = (int)(tc * 10.0f);
 
-            int td = (int)(g_vitals.temp * 10.0f);
+            // int td = (int)(s_vitals.temp * 10.0f);
 
             ui_live_t live = {
-                .temp_dC     = (int16_t)td,
-                .temp_fault  = 0u,
-                .posture     = UI_POSTURE_UNKNOWN, /* your IMU sampler fills */
-                .range_mm    = 0u,                 /* your ToF read fills    */
-                .range_fault = 0u,
+                .temp_dC     = (int16_t)(s_vitals.temp * 10.0f),
+                .temp_fault  = s_temp_fault,
+                .posture     = s_posture, /* your IMU sampler fills */
+                .range_mm    = 0u,        /* your ToF read fills    */
+                .range_fault = s_tof_fault,
                 .cpu_percent = (uint8_t)perf_cpu_percent(),
             };
-            ui_pages_render(&live); /* LIVE page (B1 cycling: connect
-                                     * ui_pages_next() to the button
-                                     * in your full design)           */
 
-            printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu  temp=%d.%dC\n",
-                   perf_cpu_percent(),
-                   (unsigned long)perf_idle_per_sec(),
-                   (unsigned long)perf_baseline(),
-                   td / 10,
-                   (td < 0 ? -td : td) % 10);
+            ui_tasks_t tasks = { .imu_stack             = osThreadGetStackSpace(s_imu_thread_id),
+                                 .vitals_stack          = osThreadGetStackSpace(s_vitals_thread_id),
+                                 .logger_stack          = osThreadGetStackSpace(s_logger_thread_id),
+                                 .ui_stack              = osThreadGetStackSpace(s_ui_thread_id),
+                                 .queue_depth           = osMessageQueueGetCount(vitalsQueueHandle),
+                                 .queue_high_water_mark = s_vitals_queue_high_water_mark };
+
+            ui_pages_render(&live, &tasks); /* LIVE page (B1 cycling: connect
+                                             * ui_pages_next() to the button
+                                             * in your full design)           */
+
+            // printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu  temp=%d.%dC\n",
+            // printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu\n",
+            //        perf_cpu_percent(),
+            //        (unsigned long)perf_idle_per_sec(),
+            //        (unsigned long)perf_baseline());
+            //    td / 10,
+            //    (td < 0 ? -td : td) % 10);
         }
     }
 }
 
-static void vitals_sample_task() {
+static void vitals_enqueue(const log_record_t* record) {
+    osStatus_t status = osMessageQueuePut(vitalsQueueHandle, record, 0, 0);
+    if (status != osOK) {
+        s_vitals_queue_drops++;
+    }
+
+    uint32_t depth = osMessageQueueGetCount(vitalsQueueHandle);
+    if (depth > s_vitals_queue_high_water_mark) {
+        s_vitals_queue_high_water_mark = depth;
+    }
+}
+
+static void vitals_task() {
     uint32_t       tick   = osKernelGetTickCount();
     const uint32_t period = osKernelGetTickFreq();
 
@@ -215,7 +352,7 @@ static void vitals_sample_task() {
         osMutexRelease(i2c3MutexHandle);
 
         // if (tof_result == VL53L0X_OK) {
-        //     g_vitals.distance_mm = distance;
+        //     s_vitals.distance_mm = distance;
         //     // printf("distance: %u mm\r\n", (unsigned)distance);
         // } else {
         //     // printf("ToF failed: %ld\r\n", (long)result);
@@ -225,9 +362,9 @@ static void vitals_sample_task() {
         log_record_t record = { .timestamp_ms = now, .channel = LOG_CH_TEMP };
 
         if (temp_result == STTS22H_OK) {
-            g_vitals.temp = temp;
+            s_vitals.temp = temp;
 
-            int16_t  temp_deci         = (int16_t)lroundf(g_vitals.temp * 10);
+            int16_t  temp_deci         = (int16_t)lroundf(s_vitals.temp * 10);
             uint16_t temp_deci_encoded = (uint16_t)temp_deci;
 
             record.payload[0] = temp_deci_encoded & 0xffu;
@@ -235,11 +372,14 @@ static void vitals_sample_task() {
             record.flags      = LOG_F_VALID;
         } else {
             record.flags = LOG_F_FAULT;
+            s_temp_fault = 1;
         }
-        osStatus_t status = osMessageQueuePut(vitalsQueueHandle, &record, 0, 0);
-        if (status != osOK) {
-            g_vitals_queue_drops++;
-        }
+
+        // osStatus_t status = osMessageQueuePut(vitalsQueueHandle, &record, 0, 0);
+        // if (status != osOK) {
+        //     s_vitals_queue_drops++;
+        // }
+        vitals_enqueue(&record);
     }
 }
 
@@ -256,27 +396,27 @@ static void imu_task() {
         log_record_t record = { .timestamp_ms = now, .channel = LOG_CH_IMU, .flags = LOG_F_FAULT };
 
         if (result != ISM330DHCX_OK) {
-            g_axes_failed_count++;
+            s_axes_failed_count++;
+            s_imu_fault = 1;
             goto cleanup;
         } else if (a.x > INT16_MAX || a.x < INT16_MIN || a.y > INT16_MAX || a.y < INT16_MIN ||
                    a.z > INT16_MAX || a.z < INT16_MIN) {
             goto cleanup;
         }
 
-        float     inc          = atan2f(-a.x, sqrtf(a.y * a.y + a.z * a.z)) * 573.0f; /* 0.1° */
-        float     roll         = atan2f(a.y, a.z) * 573.0f;
-        int32_t   incline_ddeg = (int32_t)inc - cal_incline_ddeg;
-        int32_t   roll_ddeg    = (int32_t)roll - cal_roll_ddeg;
-        posture_t posture      = POSTURE_UNKNOWN;
+        float   inc          = atan2f(-a.x, sqrtf(a.y * a.y + a.z * a.z)) * 573.0f; /* 0.1° */
+        float   roll         = atan2f(a.y, a.z) * 573.0f;
+        int32_t incline_ddeg = (int32_t)inc - cal_incline_ddeg;
+        int32_t roll_ddeg    = (int32_t)roll - cal_roll_ddeg;
 
         if (incline_ddeg > 300) {
-            posture = POSTURE_UPRIGHT;
+            s_posture = UI_POSTURE_UPRIGHT;
         } else if (roll_ddeg > 300) {
-            posture = POSTURE_RIGHT;
+            s_posture = UI_POSTURE_RIGHT;
         } else if (roll_ddeg < -300) {
-            posture = POSTURE_LEFT;
+            s_posture = UI_POSTURE_LEFT;
         } else {
-            posture = POSTURE_SUPINE;
+            s_posture = UI_POSTURE_SUPINE;
         }
 
         record.payload[0] = (uint8_t)(a.x & 0xffu);
@@ -285,16 +425,17 @@ static void imu_task() {
         record.payload[3] = (uint8_t)(a.y >> 8);
         record.payload[4] = (uint8_t)(a.z & 0xffu);
         record.payload[5] = (uint8_t)(a.z >> 8);
-        record.payload[6] = posture;
+        record.payload[6] = s_posture;
         record.payload[7] = 0;
 
         record.flags = LOG_F_VALID;
 
     cleanup:
-        int32_t status = osMessageQueuePut(vitalsQueueHandle, &record, 0, 0);
-        if (status != osOK) {
-            g_vitals_queue_drops++;
-        }
+        // int32_t status = osMessageQueuePut(vitalsQueueHandle, &record, 0, 0);
+        // if (status != osOK) {
+        //     s_vitals_queue_drops++;
+        // }
+        vitals_enqueue(&record);
     }
 }
 
@@ -307,21 +448,16 @@ static void logger_task() {
 
         if (status == osOK) {
             result = log_append(&record);
-            if (result != LOG_OK && result != LOG_FULL) {
-                // TODO
-                g_logger_errors++;
-                continue;
-            }
         } else if (status == osErrorTimeout) {
             result = log_flush();
-            if (result != LOG_OK && result != LOG_FULL) {
-                g_logger_errors++;
-                continue;
-            }
         } else {
-            // TODO
-            g_logger_errors++;
+            s_logger_errors++;
             continue;
+        }
+
+        if (result != LOG_OK && result != LOG_FULL && result != LOG_HEADER_FULL) {
+            s_logger_fault = 1;
+            s_logger_errors++;
         }
     }
 }
@@ -363,12 +499,11 @@ void app_start(void) {
                                                 .stack_size = 2048u,
                                                 .priority   = osPriorityNormal };
 
-    osThreadId_t hb = osThreadNew(HeartbeatTask, NULL, &hb_attr);
-    osThreadId_t ui = osThreadNew(UITask, NULL, &ui_attr);
-    osThreadId_t vitals_sample_thread_id =
-        osThreadNew(vitals_sample_task, NULL, &vitals_sample_attr);
-    osThreadId_t imu_thread_id    = osThreadNew(imu_task, NULL, &imu_attr);
-    osThreadId_t logger_thread_id = osThreadNew(logger_task, NULL, &logger_attr);
+    osThreadId_t hb    = osThreadNew(HeartbeatTask, NULL, &hb_attr);
+    s_ui_thread_id     = osThreadNew(UITask, NULL, &ui_attr);
+    s_vitals_thread_id = osThreadNew(vitals_task, NULL, &vitals_sample_attr);
+    s_imu_thread_id    = osThreadNew(imu_task, NULL, &imu_attr);
+    s_logger_thread_id = osThreadNew(logger_task, NULL, &logger_attr);
 
     // printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
     // printf("UI task: %s\n", ui ? "OK" : "FAILED");
@@ -381,8 +516,10 @@ void app_start(void) {
  * This callback is dormant in the smoke test, because the IMU DRDY output
  * stays disabled. Connect it when you build ImuSampleTask. */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-    if (GPIO_Pin == GPIO_PIN_2) { /* PD2 = ISM330DHCX INT1 (DRDY)     */
+    if (GPIO_Pin == INT1_Pin) { /* PD2 = ISM330DHCX INT1 (DRDY)     */
         osSemaphoreRelease(imuDrdySemHandle);
+    } else if (GPIO_Pin == User_B1_Pin) {
+        s_ui_next_page = 1;
     }
     /* PC12/PC13 (buttons) also come here in the full design. Dispatch by pin. */
 }
@@ -393,17 +530,18 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   Replace the two smoke-test tasks with FOUR tasks. The queue, the mutexes, and
   the semaphore that app_start() makes connect them:
 
-  | Task              | Priority              | Trigger                | Work                          |
+  | Task              | Priority              | Trigger                | Work |
   |-------------------|-----------------------|------------------------|-------------------------------|
-  | ImuSampleTask     | osPriorityAboveNormal | imuDrdySem (PD2 EXTI)  | read accel (i2c3Mutex),       |
-  |                   |                       |                        | classify posture, PUT record. |
-  | VitalsSampleTask  | osPriorityNormal      | osDelayUntil 1 s       | read temp + ToF (i2c3Mutex),  |
-  |                   |                       |                        | PUT temp & tof records.       |
-  | LoggerTask        | osPriorityNormal      | osMessageQueueGet      | GET record -> log_append()    |
-  |                   |                       |  (1 s flush timeout)   | (flashMutex, in log_store).   |
-  | UITask            | osPriorityLow         | osDelayUntil 50 ms     | OLED pages + cmd_table_poll   |
-  |                   |                       |                        | + %CPU + RGB. DOWNLOAD and    |
-  |                   |                       |                        | FORMAT handlers run here.     |
+  | ImuSampleTask     | osPriorityAboveNormal | imuDrdySem (PD2 EXTI)  | read accel (i2c3Mutex), |
+  |                   |                       |                        | classify posture, PUT
+record. | | VitalsSampleTask  | osPriorityNormal      | osDelayUntil 1 s       | read temp + ToF
+(i2c3Mutex),  | |                   |                       |                        | PUT temp &
+tof records.       | | LoggerTask        | osPriorityNormal      | osMessageQueueGet      | GET
+record -> log_append()    | |                   |                       |  (1 s flush timeout)   |
+(flashMutex, in log_store).   | | UITask            | osPriorityLow         | osDelayUntil 50 ms |
+OLED pages + cmd_table_poll   | |                   |                       | | + %CPU + RGB.
+DOWNLOAD and    | |                   |                       |                        | FORMAT
+handlers run here.     |
 
   Data flow:
      PD2 EXTI --give--> imuDrdySem --> ImuSampleTask --+

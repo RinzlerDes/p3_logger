@@ -12,37 +12,42 @@
  *  YOUR data flow (samplers → queue → logger → status) feeds it.
  ******************************************************************************
  */
-#include <stdio.h>
 #include "ui_pages.h"
-#include "oled.h"
+
+#include <stdio.h>
+
 #include "log_store.h"
+#include "oled.h"
 
 static ui_page_t s_page = UI_PAGE_LIVE;
 
-const char *ui_posture_name(uint8_t posture)
-{
+const char* ui_posture_name(uint8_t posture) {
     switch (posture) {
-    case UI_POSTURE_UPRIGHT: return "UPRIGHT";
-    case UI_POSTURE_SUPINE:  return "SUPINE";
-    case UI_POSTURE_LEFT:    return "LEFT";
-    case UI_POSTURE_RIGHT:   return "RIGHT";
-    case UI_POSTURE_PRONE:   return "PRONE";
-    default:                 return "----";
+        case UI_POSTURE_UPRIGHT:
+            return "UPRIGHT";
+        case UI_POSTURE_SUPINE:
+            return "SUPINE";
+        case UI_POSTURE_LEFT:
+            return "LEFT";
+        case UI_POSTURE_RIGHT:
+            return "RIGHT";
+        case UI_POSTURE_PRONE:
+            return "PRONE";
+        default:
+            return "----";
     }
 }
 
 ui_page_t ui_pages_current(void) { return s_page; }
 
-ui_page_t ui_pages_next(void)
-{
+ui_page_t ui_pages_next(void) {
     s_page = (ui_page_t)((s_page + 1u) % UI_PAGE_COUNT);
-    oled_clear();                   /* page switch repaints from scratch      */
+    oled_clear(); /* page switch repaints from scratch      */
     return s_page;
 }
 
 /* ---- LIVE: temp / posture / proximity / %CPU (PROVIDED) ------------------*/
-static void render_live(const ui_live_t *v)
-{
+static void render_live(const ui_live_t* v) {
     int whole = v->temp_dC / 10;
     int frac  = (v->temp_dC < 0 ? -v->temp_dC : v->temp_dC) % 10;
 
@@ -60,15 +65,13 @@ static void render_live(const ui_live_t *v)
 }
 
 /* ---- LOG: count / coverage / FULL-OVERFLOW state (PROVIDED) --------------*/
-static void render_log(void)
-{
+static void render_log(void) {
     log_status_t st;
     log_store_status(&st);
 
     unsigned pct = (st.capacity_records != 0u)
-                 ? (unsigned)((uint64_t)st.record_count * 100u
-                              / st.capacity_records)
-                 : 0u;
+                       ? (unsigned)((uint64_t)st.record_count * 100u / st.capacity_records)
+                       : 0u;
 
     oled_printf(0, "AL-24  LOG");
     oled_printf(2, "rec  %lu", (unsigned long)st.record_count);
@@ -90,20 +93,34 @@ static void render_log(void)
  * function. That selection is yours, because you own the design. Only YOUR
  * code can satisfy the D2 pass criterion. The stub below deliberately
  * shows nothing that a grader can grade. */
-static void render_tasks(void)
-{
-    oled_printf(0, "AL-24  TASKS");
-    oled_printf(3, "STUDENT TODO");
-    oled_printf(5, "stack hi-water/task");
-    oled_printf(6, "queue depth/hi-water");
+static void render_tasks(const ui_tasks_t* tasks) {
+    // oled_printf(0, "AL-24  TASKS");
+    // oled_printf(3, "STUDENT TODO");
+    // oled_printf(5, "stack hi-water/task");
+    // oled_printf(6, "queue depth/hi-water");
+
+    oled_printf(0, "imu %lu words", tasks->imu_stack);
+    oled_printf(1, "vitals %lu words", tasks->vitals_stack);
+    oled_printf(2, "logger %lu words", tasks->logger_stack);
+    oled_printf(3, "ui %lu words", tasks->ui_stack);
+    oled_printf(4, "queue depth %lu", tasks->queue_depth);
+    oled_printf(5, "queue high %lu", tasks->queue_high_water_mark);
 }
 
-void ui_pages_render(const ui_live_t *live)
-{
+void ui_pages_render(const ui_live_t* live, const ui_tasks_t* tasks) {
     switch (s_page) {
-    case UI_PAGE_LIVE:  render_live(live); break;
-    case UI_PAGE_LOG:   render_log();      break;
-    case UI_PAGE_TASKS: render_tasks();    break;
-    default:            s_page = UI_PAGE_LIVE; render_live(live); break;
+        case UI_PAGE_LIVE:
+            render_live(live);
+            break;
+        case UI_PAGE_LOG:
+            render_log();
+            break;
+        case UI_PAGE_TASKS:
+            render_tasks(tasks);
+            break;
+        default:
+            s_page = UI_PAGE_LIVE;
+            render_live(live);
+            break;
     }
 }
