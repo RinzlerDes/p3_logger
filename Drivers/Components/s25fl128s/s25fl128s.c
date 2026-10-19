@@ -143,25 +143,29 @@ int32_t S25FL128S_PageProgram(uint32_t addr, const uint8_t *buf, uint32_t len)
 /** Shared erase helper: WREN -> {P4E|SE} with 24-bit address -> wait. */
 static int32_t erase_at(uint32_t instruction, uint32_t addr, uint32_t tmo_ms)
 {
-    if (write_enable() != S25FL128S_OK) return S25FL128S_ERR;
+    int32_t write = write_enable();
+    if (write != S25FL128S_OK) 
+        return S25FL128S_ERR;
 
     QSPI_CommandTypeDef c = base_cmd(instruction);
     c.AddressMode = QSPI_ADDRESS_1_LINE;
     c.Address     = addr;
 
-    if (HAL_QSPI_Command(s_qspi, &c, CMD_TMO_MS) != HAL_OK) return S25FL128S_ERR;
+    if (HAL_QSPI_Command(s_qspi, &c, CMD_TMO_MS) != HAL_OK) 
+        return S25FL128S_ERR;
     return S25FL128S_WaitReady(tmo_ms);
 }
 
 int32_t S25FL128S_EraseSector4K(uint32_t addr)
 {
-    return erase_at(CMD_P4E, addr, 1000u);   /* 4K/64K erase max ~650 ms       */
-    // return erase_at(CMD_P4E, addr, 5000u);   /* 4K/64K erase max ~650 ms       */
+    // return erase_at(CMD_P4E, addr, 1000u);   /* 4K/64K erase max ~650 ms       */
+    return erase_at(CMD_P4E, addr, 20000u);   /* 4K/64K erase max ~650 ms       */
 }
 
 int32_t S25FL128S_EraseSector64K(uint32_t addr)
 {
-    return erase_at(CMD_SE, addr, 1000u);
+    // return erase_at(CMD_SE, addr, 1000u);
+    return erase_at(CMD_SE, addr, 20000u);
 }
 
 int32_t S25FL128S_EraseChip(void)

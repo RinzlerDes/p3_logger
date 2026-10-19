@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "FreeRTOS.h"
 #include "cmd_table.h"
@@ -57,7 +58,8 @@ typedef struct {
 static vitals_t s_vitals;
 static uint32_t s_vitals_queue_drops;
 static uint8_t  s_temp_fault;
-static uint8_t  s_tof_fault = 1;
+static uint8_t  s_tof_fault        = 1;
+static uint32_t s_sample_period_ms = 1000;
 
 // imu task
 // static int32_t incline_ddeg, roll_ddeg;
@@ -81,10 +83,25 @@ osThreadId_t s_ui_thread_id;
 osThreadId_t s_vitals_thread_id;
 osThreadId_t s_imu_thread_id;
 osThreadId_t s_logger_thread_id;
+osThreadId_t s_download_thread_id;
 
 typedef enum { APP_CONFIG, APP_RUN } app_mode_t;
 
 static app_mode_t s_app_mode = APP_CONFIG;
+
+#define DOWNLOAD_BATCH_SIZE 10u
+
+static uint8_t  s_download_active = 0;
+static uint32_t s_download_index  = 0;
+static uint32_t s_download_end    = 0;
+
+static volatile uint8_t  s_mark_event;
+static volatile uint32_t s_event_timestamp;
+
+static float   s_temp_baseline;
+static uint8_t s_temp_baseline_valid = 0;
+static float   s_temp_threshold_deci = 5.0f;
+static uint8_t s_temp_alert;
 
 /* ============================ POST (pre-scheduler) ======================== */
 void app_post(void) {
@@ -219,6 +236,9 @@ static void cmd_format() {
     if (s_app_mode != APP_CONFIG) {
         printf("Can only format in MODE CONFIG\n");
         return;
+    } else if (s_download_active) {
+        printf("Wait for download to finish before formatting\n");
+        return;
     }
 
     int32_t result = log_format();
@@ -229,12 +249,215 @@ static void cmd_format() {
     }
 }
 
+// static void cmd_set(int argc, char* argv[]) {
+//     if (argc != 3 || strcmp(argv[1], "PERIOD") != 0) {
+//         printf("Usage: SET PERIOD <ms>\n");
+//         return;
+//     }
+
+//     if (s_app_mode != APP_CONFIG) {
+//         printf("Must be in CONFIG mode\n");
+//         return;
+//     }
+
+//     char*         end;
+//     unsigned long period = strtoul(argv[2], &end, 10);
+
+//     if (*argv[2] == '\0' || *end != '\0' || period == 0 || period > UINT32_MAX) {
+//         printf("Invalid period\n");
+//         return;
+//     }
+
+//     s_sample_period_ms = (uint32_t)period;
+
+//     printf("Sample period set to %lu ms\n", period);
+// }
+
+static void cmd_download() {
+    if (s_download_active) {
+        printf("Download already in progress\n");
+        return;
+    }
+
+    log_status_t status;
+    log_store_status(&status);
+
+    s_download_index  = 0;
+    s_download_end    = status.record_count;
+    s_download_active = status.record_count > 0;
+
+    printf("timestamp(ms),channel,payload,flags,crc16_ok\n");
+}
+
+static void download_tick() {
+    if (!s_download_active) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < DOWNLOAD_BATCH_SIZE && s_download_index < s_download_end; i++) {
+        log_record_t record;
+        int32_t      result = log_read_record(s_download_index, &record);
+        uint8_t      crc_ok = result == LOG_OK;
+
+        if (result == LOG_ERR) {
+            printf("Failed flash read, index: %lu\n", s_download_index);
+            s_download_index++;
+            continue;
+        }
+
+        switch (record.channel) {
+            case LOG_CH_TEMP:
+                int16_t temp_deci = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+                printf("%lu,TEMP,%d,%u,%u\n", record.timestamp_ms, temp_deci, record.flags, crc_ok);
+                break;
+            case LOG_CH_IMU:
+                int16_t x = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+                int16_t y = (int16_t)(record.payload[2] | (record.payload[3] << 8));
+                int16_t z = (int16_t)(record.payload[4] | (record.payload[5] << 8));
+
+                printf("%lu,IMU,%d,%d,%d,%s,%u,%u\n",
+                       record.timestamp_ms,
+                       x,
+                       y,
+                       z,
+                       ui_posture_name(record.payload[6]),
+                       record.flags,
+                       crc_ok);
+                break;
+            case LOG_CH_EVENT:
+                uint32_t code = (uint32_t)record.payload[0] | ((uint32_t)record.payload[1] << 8) |
+                                ((uint32_t)record.payload[2] << 16) |
+                                ((uint32_t)record.payload[3] << 24);
+
+                uint32_t arg = (uint32_t)record.payload[4] | ((uint32_t)record.payload[5] << 8) |
+                               ((uint32_t)record.payload[6] << 16) |
+                               ((uint32_t)record.payload[7] << 24);
+
+                printf("%lu,EVENT,%lu,%lu,%u,%u\n",
+                       record.timestamp_ms,
+                       code,
+                       arg,
+                       record.flags,
+                       crc_ok);
+                break;
+            default:
+                printf("ERROR SHOULD NOT BE POSSIBLE\n");
+                break;
+        }
+
+        s_download_index++;
+    }
+
+    if (s_download_index >= s_download_end) {
+        s_download_active = 0;
+    }
+}
+
+// static void cmd_download() {
+//     log_status_t status;
+//     log_store_status(&status);
+
+//     if (status.record_count == 0) {
+//         printf("No records to download\n");
+//         return;
+//     }
+
+//     printf("timestamp(ms),channel,payload,flags,crc16_ok\n");
+
+//     for (uint32_t i = 0; i < status.record_count; i++) {
+//         log_record_t record;
+//         int32_t      result = log_read_record(i, &record);
+//         uint8_t      crc_ok = result == LOG_OK;
+
+//         if (result == LOG_ERR) {
+//             printf("Failed flash read, index: %lu\n", i);
+//             continue;
+//         }
+
+//         switch (record.channel) {
+//             case LOG_CH_TEMP:
+//                 int16_t temp_deci = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+//                 printf("%lu,TEMP,%d,%u,%u\n", record.timestamp_ms, temp_deci, record.flags,
+//                 crc_ok); break;
+//             case LOG_CH_IMU:
+//                 int16_t x = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+//                 int16_t y = (int16_t)(record.payload[2] | (record.payload[3] << 8));
+//                 int16_t z = (int16_t)(record.payload[4] | (record.payload[5] << 8));
+
+//                 printf("%lu,IMU,%d,%d,%d,%s,%u,%u\n",
+//                        record.timestamp_ms,
+//                        x,
+//                        y,
+//                        z,
+//                        ui_posture_name(record.payload[6]),
+//                        record.flags,
+//                        crc_ok);
+//                 break;
+//             default:
+//                 printf("ERROR SHOULD NOT BE POSSIBLE\n");
+//                 break;
+//         }
+//     }
+// }
+
+static void cmd_cpu() { printf("CPU: %u%%\n", perf_cpu_percent()); }
+
+
+static void cmd_set(int argc, char* argv[]) {
+    if (s_app_mode != APP_CONFIG) {
+        printf("Must be in CONFIG mode\n");
+        return;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "PERIOD") == 0) {
+        char* end;
+        unsigned long period = strtoul(argv[2], &end, 10);
+
+        if (argv[2][0] == '-' || *argv[2] == '\0' ||
+            *end != '\0' || period == 0 || period > UINT32_MAX) {
+            printf("Invalid period\n");
+            return;
+        }
+
+        s_sample_period_ms = (uint32_t)period;
+        printf("Sample period set to %lu ms\n", period);
+        return;
+    }
+
+    if (argc == 4 &&
+        strcmp(argv[1], "THRESH") == 0 &&
+        strcmp(argv[2], "TEMP") == 0) {
+
+        char* end;
+        unsigned long threshold = strtoul(argv[3], &end, 10);
+
+        if (argv[3][0] == '-' || *argv[3] == '\0' ||
+            *end != '\0' || threshold == 0 || threshold > 10000u) {
+            printf("Invalid temperature threshold\n");
+            return;
+        }
+
+        s_temp_threshold_deci = (float)threshold / 10.0f;
+
+        printf("Temperature threshold set to %lu deciC\n", threshold);
+        return;
+    }
+
+    printf("Usage:\n");
+    printf("  SET PERIOD <ms>\n");
+    printf("  SET THRESH TEMP <deciC>\n");
+}
+
+
 static const cmd_entry_t s_cmds[] = {
     /* STUDENT TODO: STATUS, MODE, SET, FORMAT, DOWNLOAD, CPU ... (R25) */
     { "HELP", cmd_help, "list commands" },
     { "STATUS", cmd_status, "app status" },
     { "MODE", cmd_mode, "set app mode" },
     { "FORMAT", cmd_format, "format/wipe log" },
+    { "SET", cmd_set, "set configurable parameters" },
+    { "DOWNLOAD", cmd_download, "download records from nor flash" },
+    { "CPU", cmd_cpu, "display cpu utilization" },
 };
 
 /* ============================ smoke-test tasks ============================ */
@@ -252,6 +475,39 @@ static void HeartbeatTask(void* arg) {
         on ^= 1u;
         rgb_set(0u, on ? 3u : 0u, 0u);
         osDelay(500u);
+    }
+}
+
+static void rgb_tick(uint32_t tick) {
+    static uint32_t last_toggle  = 0;
+    static uint8_t  heartbeat_on = 0;
+
+    // uint32_t now = osKernelGetTickCount();
+
+    if (tick - last_toggle >= 500u) {
+        last_toggle = tick;
+        heartbeat_on ^= 1u;
+    }
+
+    if (s_temp_alert) {
+        rgb_set(5, 0, 0);
+    } else {
+        rgb_set(0u, heartbeat_on ? 3u : 0u, 0u);
+    }
+}
+
+static void vitals_enqueue(const log_record_t* record) {
+    if (s_app_mode != APP_RUN) {
+        return;
+    }
+    osStatus_t status = osMessageQueuePut(vitalsQueueHandle, record, 0, 0);
+    if (status != osOK) {
+        s_vitals_queue_drops++;
+    }
+
+    uint32_t depth = osMessageQueueGetCount(vitalsQueueHandle);
+    if (depth > s_vitals_queue_high_water_mark) {
+        s_vitals_queue_high_water_mark = depth;
     }
 }
 
@@ -273,6 +529,17 @@ static void UITask(void* arg) {
             s_ui_next_page = 0;
             ui_pages_next();
         }
+
+        if (s_mark_event) {
+            s_mark_event        = 0;
+            log_record_t record = { .timestamp_ms = s_event_timestamp,
+                                    .channel      = LOG_CH_EVENT,
+                                    .flags        = LOG_F_MARK };
+
+            vitals_enqueue(&record);
+        }
+
+        rgb_tick(tick);
 
         cmd_table_poll(); /* non-blocking console service   */
 
@@ -316,27 +583,18 @@ static void UITask(void* arg) {
             //    td / 10,
             //    (td < 0 ? -td : td) % 10);
         }
-    }
-}
 
-static void vitals_enqueue(const log_record_t* record) {
-    osStatus_t status = osMessageQueuePut(vitalsQueueHandle, record, 0, 0);
-    if (status != osOK) {
-        s_vitals_queue_drops++;
-    }
-
-    uint32_t depth = osMessageQueueGetCount(vitalsQueueHandle);
-    if (depth > s_vitals_queue_high_water_mark) {
-        s_vitals_queue_high_water_mark = depth;
+        download_tick();
     }
 }
 
 static void vitals_task() {
-    uint32_t       tick   = osKernelGetTickCount();
-    const uint32_t period = osKernelGetTickFreq();
+    uint32_t tick = osKernelGetTickCount();
+    // const uint32_t period = osKernelGetTickFreq();
 
     for (;;) {
-        tick += period;
+        // tick += period;
+        tick += s_sample_period_ms;
         osDelayUntil(tick);
 
         uint16_t distance    = 0u;
@@ -370,6 +628,18 @@ static void vitals_task() {
             record.payload[0] = temp_deci_encoded & 0xffu;
             record.payload[1] = (temp_deci_encoded >> 8) & 0xffu;
             record.flags      = LOG_F_VALID;
+
+            if (!s_temp_baseline_valid) {
+                s_temp_baseline       = temp;
+                s_temp_baseline_valid = 1;
+            }
+
+            if ((temp - s_temp_baseline) * 10.0f >= s_temp_threshold_deci) {
+                s_temp_alert = 1;
+                record.flags |= LOG_F_ALERT;
+            } else {
+                s_temp_alert = 0;
+            }
         } else {
             record.flags = LOG_F_FAULT;
             s_temp_fault = 1;
@@ -445,6 +715,9 @@ static void logger_task() {
         log_record_t record;
         int32_t      result;
         osStatus_t   status = osMessageQueueGet(vitalsQueueHandle, &record, NULL, timeout);
+        // if (s_app_mode != APP_RUN) {
+        //     continue;
+        // }
 
         if (status == osOK) {
             result = log_append(&record);
@@ -461,6 +734,60 @@ static void logger_task() {
         }
     }
 }
+
+// static void download_task() {
+//     for (;;) {
+//         osThreadFlagsWait(DOWNLOAD_FLAG, 0, osWaitForever);
+//         log_status_t status;
+//         log_store_status(&status);
+
+//         if (status.record_count == 0) {
+//             printf("No records to download\n");
+//             continue;
+//         }
+
+//         printf("timestamp(ms),channel,payload,flags,crc16_ok\n");
+
+//         for (uint32_t i = 0; i < status.record_count; i++) {
+//             log_record_t record;
+//             int32_t      result = log_read_record(i, &record);
+//             uint8_t      crc_ok = result == LOG_OK;
+
+//             if (result == LOG_ERR) {
+//                 printf("Failed flash read, index: %lu\n", i);
+//                 continue;
+//             }
+
+//             switch (record.channel) {
+//                 case LOG_CH_TEMP:
+//                     int16_t temp_deci = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+//                     printf("%lu,TEMP,%d,%u,%u\n",
+//                            record.timestamp_ms,
+//                            temp_deci,
+//                            record.flags,
+//                            crc_ok);
+//                     break;
+//                 case LOG_CH_IMU:
+//                     int16_t x = (int16_t)(record.payload[0] | (record.payload[1] << 8));
+//                     int16_t y = (int16_t)(record.payload[2] | (record.payload[3] << 8));
+//                     int16_t z = (int16_t)(record.payload[4] | (record.payload[5] << 8));
+
+//                     printf("%lu,IMU,%d,%d,%d,%s,%u,%u\n",
+//                            record.timestamp_ms,
+//                            x,
+//                            y,
+//                            z,
+//                            ui_posture_name(record.payload[6]),
+//                            record.flags,
+//                            crc_ok);
+//                     break;
+//                 default:
+//                     printf("ERROR SHOULD NOT BE POSSIBLE\n");
+//                     break;
+//             }
+//         }
+//     }
+// }
 
 /* ============================ app_start ================================== */
 
@@ -487,7 +814,8 @@ void app_start(void) {
     cmd_table_init(s_cmds, sizeof(s_cmds) / sizeof(s_cmds[0]));
 
     /* --- smoke-test tasks (REPLACE with the logger — see block below) --- */
-    const osThreadAttr_t hb_attr = { .name = "hb", .stack_size = 512u, .priority = osPriorityLow };
+    // const osThreadAttr_t hb_attr = { .name = "hb", .stack_size = 512u, .priority = osPriorityLow
+    // };
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u, .priority = osPriorityLow };
     const osThreadAttr_t vitals_sample_attr = { .name       = "vitals_sample",
                                                 .stack_size = 2048u,
@@ -498,12 +826,16 @@ void app_start(void) {
     const osThreadAttr_t logger_attr        = { .name       = "logger",
                                                 .stack_size = 2048u,
                                                 .priority   = osPriorityNormal };
+    // const osThreadAttr_t download_attr      = { .name       = "download",
+    //                                             .stack_size = 2048u,
+    //                                             .priority   = osPriorityLow1 };
 
-    osThreadId_t hb    = osThreadNew(HeartbeatTask, NULL, &hb_attr);
+    // osThreadId_t hb    = osThreadNew(HeartbeatTask, NULL, &hb_attr);
     s_ui_thread_id     = osThreadNew(UITask, NULL, &ui_attr);
     s_vitals_thread_id = osThreadNew(vitals_task, NULL, &vitals_sample_attr);
     s_imu_thread_id    = osThreadNew(imu_task, NULL, &imu_attr);
     s_logger_thread_id = osThreadNew(logger_task, NULL, &logger_attr);
+    // s_download_thread_id = osThreadNew(download_task, NULL, &download_attr);
 
     // printf("Heartbeat task: %s\n", hb ? "OK" : "FAILED");
     // printf("UI task: %s\n", ui ? "OK" : "FAILED");
@@ -520,6 +852,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         osSemaphoreRelease(imuDrdySemHandle);
     } else if (GPIO_Pin == User_B1_Pin) {
         s_ui_next_page = 1;
+    } else if (GPIO_Pin == User_B2_Pin) {
+        s_mark_event      = 1;
+        s_event_timestamp = HAL_GetTick();
     }
     /* PC12/PC13 (buttons) also come here in the full design. Dispatch by pin. */
 }

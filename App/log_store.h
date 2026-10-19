@@ -77,7 +77,7 @@ int32_t log_format(void);
 int32_t log_append(const log_record_t* rec);
 
 /** Read committed record #index (0 .. record_count-1) for DOWNLOAD.
- *  @retval LOG_OK / LOG_ERR. */
+ *  @retval LOG_OK / LOG_ERR. / LOG_CRC_ERR */
 int32_t log_read_record(uint32_t index, log_record_t* out);
 
 /** Snapshot the log status for STATUS / the OLED LOG page. */

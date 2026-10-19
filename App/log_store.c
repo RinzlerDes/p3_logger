@@ -21,7 +21,7 @@
 
 /* ---- Flash layout (demo-scaled small so LOG FULL is reachable — R21/§7.3) -*/
 #define HEADER_ADDR 0x000000u /* one 4-KB parameter sector   */
-// #define DATA_BASE        0x010000u /* first 64-KB uniform sector  */
+// #define DATA_BASE   0x010000u /* first 64-KB uniform sector  */
 #define DATA_BASE        0x020000u
 #define DATA_SECTORS     2u /* 2 x 64 KB = 128 KB          */
 #define DATA_SIZE        (DATA_SECTORS * S25FL128S_SECTOR_64K)
@@ -148,10 +148,13 @@ int32_t log_format(void) {
      * about 650 ms. That cost is the cause of the CONFIG-only,
      * operator-announced FORMAT command. */
     int32_t rc_header = LOG_OK;
-    if (S25FL128S_EraseSector4K(HEADER_ADDR) != S25FL128S_OK) rc_header = LOG_ERR;
+    if (S25FL128S_EraseSector4K(HEADER_ADDR) != S25FL128S_OK) {
+        rc_header = LOG_ERR;
+    }
     for (uint32_t i = 0; rc_header == LOG_OK && i < DATA_SECTORS; i++) {
-        if (S25FL128S_EraseSector64K(DATA_BASE + i * S25FL128S_SECTOR_64K) != S25FL128S_OK)
+        if (S25FL128S_EraseSector64K(DATA_BASE + i * S25FL128S_SECTOR_64K) != S25FL128S_OK) {
             rc = LOG_ERR;
+        }
     }
     flash_unlock();
 
