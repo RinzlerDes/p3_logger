@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "FreeRTOS.h"
 #include "cmd_table.h"
@@ -46,6 +47,7 @@ extern QSPI_HandleTypeDef hqspi; /* CubeMX-generated once QUADSPI is on   */
 
 /* ---- shared RTOS handles (declared extern in tasks.h / log_store.c) --------*/
 osMutexId_t        flashMutexHandle;
+osSemaphoreId_t    flashSemaphoreHandle;
 osMutexId_t        i2c3MutexHandle;
 osMessageQueueId_t vitalsQueueHandle;
 osSemaphoreId_t    imuDrdySemHandle;
@@ -72,6 +74,7 @@ static ui_posture_t s_posture = UI_POSTURE_UNKNOWN;
 // logger task
 static uint32_t s_logger_errors;
 static uint8_t  s_logger_fault;
+static volatile uint8_t s_logger_busy;
 
 // ui task
 static uint8_t volatile s_ui_next_page;
@@ -89,11 +92,14 @@ typedef enum { APP_CONFIG, APP_RUN } app_mode_t;
 
 static app_mode_t s_app_mode = APP_CONFIG;
 
-#define DOWNLOAD_BATCH_SIZE 10u
+#define DOWNLOAD_LINES_PER_TICK 10u
 
 static uint8_t  s_download_active = 0;
 static uint32_t s_download_index  = 0;
 static uint32_t s_download_end    = 0;
+static log_record_t s_download_buffer[LOG_DOWNLOAD_CHUNK_RECORDS];
+static uint32_t s_download_buffer_count;
+static uint32_t s_download_buffer_pos;
 
 static volatile uint8_t  s_mark_event;
 static volatile uint32_t s_event_timestamp;
@@ -155,7 +161,9 @@ static void cmd_status(int argc, char* argv[]) {
     (void)argv;
 
     log_status_t st;
+    log_gr_stats_t gr;
     log_store_status(&st);
+    log_gr_get_stats(&gr);
 
     uint32_t uptime   = HAL_GetTick() / 1000u;
     uint32_t coverage = st.capacity_records
@@ -202,6 +210,10 @@ static void cmd_status(int argc, char* argv[]) {
            osMessageQueueGetCount(vitalsQueueHandle),
            s_vitals_queue_high_water_mark,
            s_vitals_queue_drops);
+    printf("GR-A:    inheritance=%s, samples=%lu, max_wait=%lu ms\n",
+           gr.inheritance_enabled ? "ON" : "OFF",
+           gr.sample_count,
+           gr.max_wait_ms);
 
     printf("Stack min free (words):\n");
     printf("IMU=%lu\n", osThreadGetStackSpace(s_imu_thread_id) / 4);
@@ -232,7 +244,10 @@ static void cmd_mode(int argc, char* argv[]) {
     printf("Mode set to %s\r\n", app_mode_name());
 }
 
-static void cmd_format() {
+static void cmd_format(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
     if (s_app_mode != APP_CONFIG) {
         printf("Can only format in MODE CONFIG\n");
         return;
@@ -273,7 +288,10 @@ static void cmd_format() {
 //     printf("Sample period set to %lu ms\n", period);
 // }
 
-static void cmd_download() {
+static void cmd_download(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
     if (s_download_active) {
         printf("Download already in progress\n");
         return;
@@ -285,71 +303,117 @@ static void cmd_download() {
     s_download_index  = 0;
     s_download_end    = status.record_count;
     s_download_active = status.record_count > 0;
+    s_download_buffer_count = 0u;
+    s_download_buffer_pos   = 0u;
 
     printf("timestamp(ms),channel,payload,flags,crc16_ok\n");
+    if (!s_download_active) printf("# No committed records\n");
 }
 
-static void download_tick() {
-    if (!s_download_active) {
-        return;
+static void download_print_record(const log_record_t* record) {
+    uint8_t crc_ok = record->crc16 ==
+                     log_crc16((const uint8_t*)record,
+                               sizeof(log_record_t) - sizeof(record->crc16));
+
+    switch (record->channel) {
+        case LOG_CH_TEMP: {
+            int16_t temp_deci =
+                (int16_t)(record->payload[0] | ((uint16_t)record->payload[1] << 8));
+            printf("%lu,TEMP,%d,%u,%u\n",
+                   record->timestamp_ms,
+                   temp_deci,
+                   record->flags,
+                   crc_ok);
+            break;
+        }
+        case LOG_CH_IMU: {
+            int16_t x = (int16_t)(record->payload[0] | ((uint16_t)record->payload[1] << 8));
+            int16_t y = (int16_t)(record->payload[2] | ((uint16_t)record->payload[3] << 8));
+            int16_t z = (int16_t)(record->payload[4] | ((uint16_t)record->payload[5] << 8));
+
+            printf("%lu,IMU,%d,%d,%d,%s,%u,%u\n",
+                   record->timestamp_ms,
+                   x,
+                   y,
+                   z,
+                   ui_posture_name(record->payload[6]),
+                   record->flags,
+                   crc_ok);
+            break;
+        }
+        case LOG_CH_TOF: {
+            uint16_t range_mm =
+                (uint16_t)(record->payload[0] | ((uint16_t)record->payload[1] << 8));
+            printf("%lu,TOF,%u,%u,%u\n",
+                   record->timestamp_ms,
+                   range_mm,
+                   record->flags,
+                   crc_ok);
+            break;
+        }
+        case LOG_CH_EVENT: {
+            uint32_t code = (uint32_t)record->payload[0] |
+                            ((uint32_t)record->payload[1] << 8) |
+                            ((uint32_t)record->payload[2] << 16) |
+                            ((uint32_t)record->payload[3] << 24);
+            uint32_t arg = (uint32_t)record->payload[4] |
+                           ((uint32_t)record->payload[5] << 8) |
+                           ((uint32_t)record->payload[6] << 16) |
+                           ((uint32_t)record->payload[7] << 24);
+
+            printf("%lu,EVENT,%lu,%lu,%u,%u\n",
+                   record->timestamp_ms,
+                   code,
+                   arg,
+                   record->flags,
+                   crc_ok);
+            break;
+        }
+        default:
+            printf("%lu,UNKNOWN,%u,%u,%u\n",
+                   record->timestamp_ms,
+                   record->channel,
+                   record->flags,
+                   crc_ok);
+            break;
+    }
+}
+
+static void download_tick(void) {
+    if (!s_download_active) return;
+
+    /* Read at most 4 KB under one low-priority UI-task guard hold, then do
+     * all slow UART formatting after releasing it. This is both R9-compliant
+     * chunking and the low-priority critical section used by GR-A. */
+    if (s_download_buffer_pos >= s_download_buffer_count &&
+        s_download_index < s_download_end) {
+        uint32_t count = s_download_end - s_download_index;
+        if (count > LOG_DOWNLOAD_CHUNK_RECORDS) count = LOG_DOWNLOAD_CHUNK_RECORDS;
+
+        if (log_read_records(s_download_index, count, s_download_buffer) != LOG_OK) {
+            printf("# Failed flash read, records %lu..%lu\n",
+                   s_download_index,
+                   s_download_index + count - 1u);
+            s_download_index += count;
+            s_download_buffer_count = 0u;
+            s_download_buffer_pos   = 0u;
+        } else {
+            s_download_index += count;
+            s_download_buffer_count = count;
+            s_download_buffer_pos   = 0u;
+        }
     }
 
-    for (uint32_t i = 0; i < DOWNLOAD_BATCH_SIZE && s_download_index < s_download_end; i++) {
-        log_record_t record;
-        int32_t      result = log_read_record(s_download_index, &record);
-        uint8_t      crc_ok = result == LOG_OK;
-
-        if (result == LOG_ERR) {
-            printf("Failed flash read, index: %lu\n", s_download_index);
-            s_download_index++;
-            continue;
-        }
-
-        switch (record.channel) {
-            case LOG_CH_TEMP:
-                int16_t temp_deci = (int16_t)(record.payload[0] | (record.payload[1] << 8));
-                printf("%lu,TEMP,%d,%u,%u\n", record.timestamp_ms, temp_deci, record.flags, crc_ok);
-                break;
-            case LOG_CH_IMU:
-                int16_t x = (int16_t)(record.payload[0] | (record.payload[1] << 8));
-                int16_t y = (int16_t)(record.payload[2] | (record.payload[3] << 8));
-                int16_t z = (int16_t)(record.payload[4] | (record.payload[5] << 8));
-
-                printf("%lu,IMU,%d,%d,%d,%s,%u,%u\n",
-                       record.timestamp_ms,
-                       x,
-                       y,
-                       z,
-                       ui_posture_name(record.payload[6]),
-                       record.flags,
-                       crc_ok);
-                break;
-            case LOG_CH_EVENT:
-                uint32_t code = (uint32_t)record.payload[0] | ((uint32_t)record.payload[1] << 8) |
-                                ((uint32_t)record.payload[2] << 16) |
-                                ((uint32_t)record.payload[3] << 24);
-
-                uint32_t arg = (uint32_t)record.payload[4] | ((uint32_t)record.payload[5] << 8) |
-                               ((uint32_t)record.payload[6] << 16) |
-                               ((uint32_t)record.payload[7] << 24);
-
-                printf("%lu,EVENT,%lu,%lu,%u,%u\n",
-                       record.timestamp_ms,
-                       code,
-                       arg,
-                       record.flags,
-                       crc_ok);
-                break;
-            default:
-                printf("ERROR SHOULD NOT BE POSSIBLE\n");
-                break;
-        }
-
-        s_download_index++;
+    uint32_t lines = 0u;
+    while (lines < DOWNLOAD_LINES_PER_TICK &&
+           s_download_buffer_pos < s_download_buffer_count) {
+        download_print_record(&s_download_buffer[s_download_buffer_pos++]);
+        lines++;
     }
 
-    if (s_download_index >= s_download_end) {
-        s_download_active = 0;
+    if (s_download_index >= s_download_end &&
+        s_download_buffer_pos >= s_download_buffer_count) {
+        s_download_active = 0u;
     }
 }
 
@@ -400,7 +464,80 @@ static void download_tick() {
 //     }
 // }
 
-static void cmd_cpu() { printf("CPU: %u%%\n", perf_cpu_percent()); }
+static uint8_t gr_reconfigure_ready(void) {
+    if (s_app_mode != APP_CONFIG) {
+        printf("GR-A changes require MODE CONFIG\n");
+        return 0u;
+    }
+    if (s_download_active) {
+        printf("Wait for DOWNLOAD to finish\n");
+        return 0u;
+    }
+    if (s_logger_busy || osMessageQueueGetCount(vitalsQueueHandle) != 0u) {
+        printf("Wait for LoggerTask to drain the queue\n");
+        return 0u;
+    }
+    return 1u;
+}
+
+static void gr_reset_results(void) {
+    log_gr_reset();
+    s_vitals_queue_drops           = 0u;
+    s_vitals_queue_high_water_mark = osMessageQueueGetCount(vitalsQueueHandle);
+}
+
+static void cmd_inherit(int argc, char* argv[]) {
+    if (argc != 2 || (strcmp(argv[1], "ON") != 0 && strcmp(argv[1], "OFF") != 0)) {
+        printf("Usage: INHERIT ON|OFF\n");
+        return;
+    }
+    if (!gr_reconfigure_ready()) return;
+
+    log_gr_set_inheritance(strcmp(argv[1], "ON") == 0);
+    gr_reset_results();
+    printf("GR-A inheritance %s; histogram and queue counters reset\n", argv[1]);
+}
+
+static void cmd_grreset(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+    if (!gr_reconfigure_ready()) return;
+    gr_reset_results();
+    printf("GR-A histogram and queue counters reset\n");
+}
+
+static void cmd_grstats(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
+    static const char* labels[LOG_GR_HIST_BINS] = {
+        "0 ms", "1 ms", "2-4 ms", "5-9 ms",
+        "10-19 ms", "20-49 ms", "50-99 ms", "100+ ms"
+    };
+    log_gr_stats_t stats;
+    log_gr_get_stats(&stats);
+    uint32_t average = stats.sample_count ? stats.total_wait_ms / stats.sample_count : 0u;
+
+    printf("\n=== GR-A FLASH WAIT HISTOGRAM ===\n");
+    printf("inheritance=%s samples=%lu avg=%lu ms max=%lu ms\n",
+           stats.inheritance_enabled ? "ON" : "OFF",
+           stats.sample_count,
+           average,
+           stats.max_wait_ms);
+    for (uint32_t i = 0u; i < LOG_GR_HIST_BINS; i++) {
+        printf("%-8s : %lu\n", labels[i], stats.bins[i]);
+    }
+    printf("queue_depth=%lu high_water=%lu drops=%lu\n",
+           osMessageQueueGetCount(vitalsQueueHandle),
+           s_vitals_queue_high_water_mark,
+           s_vitals_queue_drops);
+}
+
+static void cmd_cpu(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+    printf("CPU: %u%%\n", perf_cpu_percent());
+}
 
 
 static void cmd_set(int argc, char* argv[]) {
@@ -458,6 +595,9 @@ static const cmd_entry_t s_cmds[] = {
     { "SET", cmd_set, "set configurable parameters" },
     { "DOWNLOAD", cmd_download, "download records from nor flash" },
     { "CPU", cmd_cpu, "display cpu utilization" },
+    { "INHERIT", cmd_inherit, "INHERIT ON|OFF (GR-A)" },
+    { "GRRESET", cmd_grreset, "clear the GR-A wait histogram" },
+    { "GRSTATS", cmd_grstats, "display the GR-A wait histogram" },
 };
 
 /* ============================ smoke-test tasks ============================ */
@@ -468,7 +608,7 @@ static const cmd_entry_t s_cmds[] = {
  * for a blink. In the full logger the RGB LED belongs to the UI task. This
  * blocking cost is the cause of the rule that keeps ALERT LED writes off the
  * sample path. */
-static void HeartbeatTask(void* arg) {
+static void __attribute__((unused)) HeartbeatTask(void* arg) {
     (void)arg;
     uint32_t on = 0u;
     for (;;) {
@@ -602,6 +742,10 @@ static void vitals_task() {
         int32_t  temp_result = STTS22H_ERROR;
         float    temp;
 
+        /* Keep the disabled ToF path ready without producing build noise. */
+        (void)distance;
+        (void)tof_result;
+
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
         uint32_t now = HAL_GetTick();
         temp_result  = STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
@@ -720,13 +864,19 @@ static void logger_task() {
         // }
 
         if (status == osOK) {
+            s_logger_busy = 1u;
             result = log_append(&record);
         } else if (status == osErrorTimeout) {
+            /* CONFIG has no producers. Avoid starting a new flash operation
+             * there so INHERIT can safely switch between the two guards. */
+            if (s_app_mode != APP_RUN) continue;
+            s_logger_busy = 1u;
             result = log_flush();
         } else {
             s_logger_errors++;
             continue;
         }
+        s_logger_busy = 0u;
 
         if (result != LOG_OK && result != LOG_FULL && result != LOG_HEADER_FULL) {
             s_logger_fault = 1;
@@ -797,6 +947,7 @@ void app_start(void) {
      * Refer to GR-A in the spec for a NON-inheriting variant. */
     const osMutexAttr_t mtx_attr = { .attr_bits = osMutexPrioInherit };
     flashMutexHandle             = osMutexNew(&mtx_attr);
+    flashSemaphoreHandle         = osSemaphoreNew(1u, 1u, NULL);
     i2c3MutexHandle              = osMutexNew(&mtx_attr);
 
     /* Producer->consumer queue: 16 records of 16 bytes (spec R8). */
@@ -825,7 +976,7 @@ void app_start(void) {
                                                 .priority   = osPriorityAboveNormal };
     const osThreadAttr_t logger_attr        = { .name       = "logger",
                                                 .stack_size = 2048u,
-                                                .priority   = osPriorityNormal };
+                                                .priority   = osPriorityHigh };
     // const osThreadAttr_t download_attr      = { .name       = "download",
     //                                             .stack_size = 2048u,
     //                                             .priority   = osPriorityLow1 };
@@ -871,7 +1022,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   |                   |                       |                        | classify posture, PUT
 record. | | VitalsSampleTask  | osPriorityNormal      | osDelayUntil 1 s       | read temp + ToF
 (i2c3Mutex),  | |                   |                       |                        | PUT temp &
-tof records.       | | LoggerTask        | osPriorityNormal      | osMessageQueueGet      | GET
+tof records.       | | LoggerTask        | osPriorityHigh        | osMessageQueueGet      | GET
 record -> log_append()    | |                   |                       |  (1 s flush timeout)   |
 (flashMutex, in log_store).   | | UITask            | osPriorityLow         | osDelayUntil 50 ms |
 OLED pages + cmd_table_poll   | |                   |                       | | + %CPU + RGB.

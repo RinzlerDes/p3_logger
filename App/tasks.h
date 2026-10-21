@@ -22,6 +22,7 @@
 /* Shared synchronization handles (app_start makes them, and the application
  * and log_store.c use them). */
 extern osMutexId_t       flashMutexHandle;   /* PRIMARY guarded resource (R6) */
+extern osSemaphoreId_t   flashSemaphoreHandle; /* GR-A: non-inheriting guard  */
 extern osMutexId_t       i2c3MutexHandle;    /* SECONDARY: the sensor bus (R7) */
 extern osMessageQueueId_t vitalsQueueHandle; /* samplers -> logger (R8)        */
 extern osSemaphoreId_t   imuDrdySemHandle;   /* IMU DRDY ISR -> task (R4)      */

@@ -49,6 +49,18 @@ typedef struct {
     uint32_t overflow_count;   /* records refused after LOG FULL              */
 } log_status_t;
 
+/* GR-A: LoggerTask wait-time histogram for the selected flash guard. */
+#define LOG_GR_HIST_BINS            8u
+#define LOG_DOWNLOAD_CHUNK_RECORDS 256u /* 256 records x 16 B = 4 KB (R9) */
+
+typedef struct {
+    uint8_t  inheritance_enabled;
+    uint32_t sample_count;
+    uint32_t total_wait_ms;
+    uint32_t max_wait_ms;
+    uint32_t bins[LOG_GR_HIST_BINS];
+} log_gr_stats_t;
+
 /* ---- Return codes ---------------------------------------------------------*/
 #define LOG_OK          0
 #define LOG_ERR         -1
@@ -80,10 +92,21 @@ int32_t log_append(const log_record_t* rec);
  *  @retval LOG_OK / LOG_ERR. / LOG_CRC_ERR */
 int32_t log_read_record(uint32_t index, log_record_t* out);
 
+/** Read a bounded, contiguous DOWNLOAD chunk under one flash guard hold.
+ *  `count` is limited to LOG_DOWNLOAD_CHUNK_RECORDS (4 KB). CRC validation
+ *  remains per-record in the DOWNLOAD formatter. */
+int32_t log_read_records(uint32_t first, uint32_t count, log_record_t* out);
+
 /** Snapshot the log status for STATUS / the OLED LOG page. */
 void log_store_status(log_status_t* out);
 
 // @retval LOG_OK, LOG_FULL (spec R21), LOG_ERR.
 int32_t log_flush();
+
+/** GR-A controls and results. Change modes only while logging and DOWNLOAD
+ *  are quiescent; tasks.c enforces that console-side precondition. */
+void log_gr_set_inheritance(uint8_t enabled);
+void log_gr_reset(void);
+void log_gr_get_stats(log_gr_stats_t* out);
 
 #endif /* LOG_STORE_H */

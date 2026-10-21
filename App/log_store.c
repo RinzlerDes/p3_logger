@@ -13,11 +13,11 @@
  */
 #include "log_store.h"
 
-#include "cmsis_os2.h" /* osMutexAcquire/Release (available after the
-                                 * FreeRTOS regen — see README)                */
+#include "cmsis_os2.h"
 #include <string.h>
 
 #include "s25fl128s.h"
+#include "stm32wbxx_hal.h"
 
 /* ---- Flash layout (demo-scaled small so LOG FULL is reachable — R21/§7.3) -*/
 #define HEADER_ADDR 0x000000u /* one 4-KB parameter sector   */
@@ -33,15 +33,15 @@
  * fixed 32-B SLOTS. It writes one slot at a time, in sequence, with a
  * page-program only. NOR flash lets you page-program erased (0xFF) bytes one
  * time, so each header update takes the NEXT free slot. Only FORMAT erases
- * the sector. That behavior spreads the wear across 128 slots in each erase
- * cycle (the "rotating slot").
+ * the sector. A checkpoint is written every four data pages; on boot the
+ * records after the last checkpoint are scanned and recovered. This lets the
+ * 128 header slots describe all 512 data pages without a hot-path erase.
  *
  * PROVIDED: the struct, the slot geometry, and the `magic` value.
  * STUDENT TODO: the recovery scan at boot, and the slot-rotation update. The
  * scan must find the LAST slot that has a correct CRC. An erased slot reads
  * as all-0xFF and thus cannot agree with the `magic` value. The update must
- * take the next free slot. A sector that holds only spent slots means that
- * it is FORMAT time anyway. */
+ * take the next free slot. */
 #define LOG_HDR_MAGIC 0x414C3234u /* "AL24"                    */
 
 typedef struct __attribute__((packed)) {
@@ -60,14 +60,23 @@ _Static_assert(sizeof(log_header_t) == 32u, "header slot must stay 32 B");
 #define HDR_SLOT_COUNT   (S25FL128S_SECTOR_4K / HDR_SLOT_SIZE) /* 128    */
 #define HDR_SLOT_ADDR(i) (HEADER_ADDR + (i) * HDR_SLOT_SIZE)
 
+/* One checkpoint per four 256-byte data pages makes the 4-KB header sector
+ * cover the complete 128-KB data region. Slot 0 describes the freshly
+ * formatted log and the final slot is reserved for the LOG FULL checkpoint. */
+#define HDR_CHECKPOINT_PAGES   4u
+#define HDR_CHECKPOINT_RECORDS \
+    (HDR_CHECKPOINT_PAGES * S25FL128S_PAGE_SIZE / sizeof(log_record_t))
+
 #define RECORD_SIZE         sizeof(log_record_t)
 #define HEADER_SIZE         sizeof(log_header_t)
 #define CRC_SIZE            sizeof(uint16_t)
 #define RECORD_SLOT_ADDR(i) (DATA_BASE + (i) * RECORD_SIZE)
 
-/* tasks.c (app_start) makes flashMutex. log_store is the one caller that
- * takes it, and flash_lock()/flash_unlock() enclose each flash operation. */
-extern osMutexId_t flashMutexHandle;
+/* tasks.c makes both GR-A guards. A CMSIS mutex inherits priority in this
+ * FreeRTOS adapter; a plain binary semaphore intentionally does not. */
+extern osMutexId_t     flashMutexHandle;
+extern osSemaphoreId_t flashSemaphoreHandle;
+extern osThreadId_t    s_logger_thread_id;
 
 /* ---- module state ---------------------------------------------------------*/
 static uint32_t s_write_off; /* byte offset into data region*/
@@ -78,9 +87,115 @@ static uint8_t  s_page[S25FL128S_PAGE_SIZE]; /* RAM staging page (256 B)    */
 static uint32_t s_page_fill;                 /* bytes buffered in s_page    */
 static uint32_t s_session_id;
 static uint32_t s_header_count;
+static uint32_t s_persisted_count;
+static volatile uint8_t s_gr_inheritance_enabled = 1u;
+static log_gr_stats_t    s_gr_stats = { .inheritance_enabled = 1u };
 
-static inline void flash_lock(void) { osMutexAcquire(flashMutexHandle, osWaitForever); }
-static inline void flash_unlock(void) { osMutexRelease(flashMutexHandle); }
+typedef enum {
+    FLASH_LOCK_INVALID = 0,
+    FLASH_LOCK_MUTEX,
+    FLASH_LOCK_SEMAPHORE,
+} flash_lock_kind_t;
+
+static void gr_record_wait(uint32_t wait_ms) {
+    uint32_t bin;
+
+    if (wait_ms == 0u)
+        bin = 0u;
+    else if (wait_ms == 1u)
+        bin = 1u;
+    else if (wait_ms < 5u)
+        bin = 2u;
+    else if (wait_ms < 10u)
+        bin = 3u;
+    else if (wait_ms < 20u)
+        bin = 4u;
+    else if (wait_ms < 50u)
+        bin = 5u;
+    else if (wait_ms < 100u)
+        bin = 6u;
+    else
+        bin = 7u;
+
+    s_gr_stats.bins[bin]++;
+    s_gr_stats.sample_count++;
+    s_gr_stats.total_wait_ms += wait_ms;
+    if (wait_ms > s_gr_stats.max_wait_ms) s_gr_stats.max_wait_ms = wait_ms;
+}
+
+/* Return the exact object acquired so release remains correct even if a bad
+ * caller attempts to change mode concurrently. tasks.c only permits a mode
+ * change while CONFIG is quiescent, so the two guards never overlap. */
+static flash_lock_kind_t flash_lock(void) {
+    flash_lock_kind_t kind = s_gr_inheritance_enabled ? FLASH_LOCK_MUTEX
+                                                      : FLASH_LOCK_SEMAPHORE;
+    uint8_t measure = (osKernelGetState() == osKernelRunning) &&
+                      (osThreadGetId() == s_logger_thread_id);
+    uint32_t requested_ms = measure ? HAL_GetTick() : 0u;
+    osStatus_t status;
+
+    if (kind == FLASH_LOCK_MUTEX)
+        status = osMutexAcquire(flashMutexHandle, osWaitForever);
+    else
+        status = osSemaphoreAcquire(flashSemaphoreHandle, osWaitForever);
+
+    if (status != osOK) return FLASH_LOCK_INVALID;
+    if (measure) gr_record_wait(HAL_GetTick() - requested_ms);
+    return kind;
+}
+
+static osStatus_t flash_unlock(flash_lock_kind_t kind) {
+    if (kind == FLASH_LOCK_MUTEX) return osMutexRelease(flashMutexHandle);
+    if (kind == FLASH_LOCK_SEMAPHORE) return osSemaphoreRelease(flashSemaphoreHandle);
+    return osErrorParameter;
+}
+
+void log_gr_set_inheritance(uint8_t enabled) {
+    s_gr_inheritance_enabled       = enabled ? 1u : 0u;
+    s_gr_stats.inheritance_enabled = s_gr_inheritance_enabled;
+}
+
+void log_gr_reset(void) {
+    uint8_t enabled = s_gr_inheritance_enabled;
+    memset(&s_gr_stats, 0, sizeof(s_gr_stats));
+    s_gr_stats.inheritance_enabled = enabled;
+}
+
+void log_gr_get_stats(log_gr_stats_t* out) {
+    if (out != NULL) *out = s_gr_stats;
+}
+
+static int32_t header_write_checkpoint(void) {
+    if (s_header_count >= HDR_SLOT_COUNT) return LOG_HEADER_FULL;
+
+    log_header_t header = { .magic        = LOG_HDR_MAGIC,
+                            .session_id   = s_session_id,
+                            .write_off    = s_write_off,
+                            .record_count = s_count,
+                            .log_full     = s_full };
+    header.crc16 = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
+
+    flash_lock_kind_t lock = flash_lock();
+    if (lock == FLASH_LOCK_INVALID) return LOG_ERR;
+
+    int32_t result = S25FL128S_PageProgram(HDR_SLOT_ADDR(s_header_count),
+                                           (const uint8_t*)&header,
+                                           HDR_SLOT_SIZE);
+    if (flash_unlock(lock) != osOK) return LOG_ERR;
+    if (result != S25FL128S_OK) return LOG_ERR;
+
+    s_header_count++;
+    s_persisted_count = s_count;
+    return LOG_OK;
+}
+
+static uint8_t record_is_erased(const log_record_t* record) {
+    const uint8_t* bytes = (const uint8_t*)record;
+    for (uint32_t i = 0u; i < RECORD_SIZE; i++) {
+        if (bytes[i] != 0xFFu) return 0u;
+    }
+    return 1u;
+}
 
 /* ---- CRC-16/CCITT (poly 0x1021, init 0xFFFF) — GIVEN, do not change -------*/
 uint16_t log_crc16(const uint8_t* data, uint32_t len) {
@@ -109,8 +224,17 @@ int32_t log_store_init(void) {
 
     int32_t result = LOG_OK;
 
-    // holding flash mutex for longer than necessary but this is init function, should only run once
-    flash_lock();
+    s_write_off       = 0u;
+    s_count           = 0u;
+    s_full            = 0u;
+    s_overflow        = 0u;
+    s_page_fill       = 0u;
+    s_session_id      = 0u;
+    s_header_count    = 0u;
+    s_persisted_count = 0u;
+
+    /* POST runs before the kernel and before the guards exist. It is the only
+     * thread, so this recovery scan is inherently serialized. */
     for (int32_t i = HDR_SLOT_COUNT - 1; i >= 0; i--) {
         log_header_t header;
         result = S25FL128S_Read(HDR_SLOT_ADDR(i), (uint8_t*)&header, HEADER_SIZE);
@@ -124,7 +248,9 @@ int32_t log_store_init(void) {
         }
 
         uint16_t crc = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
-        if (crc != header.crc16) {
+        if (crc != header.crc16 || header.write_off > DATA_SIZE ||
+            header.record_count > CAPACITY_RECORDS ||
+            header.write_off != header.record_count * RECORD_SIZE) {
             continue;
         }
 
@@ -133,30 +259,59 @@ int32_t log_store_init(void) {
         s_count        = header.record_count;
         s_full         = header.log_full;
         s_header_count = i + 1;
+        s_persisted_count = s_count;
         break;
     }
-    flash_unlock();
 
+    if (result != S25FL128S_OK) return LOG_ERR;
+
+    /* Checkpoints deliberately lag the data by at most a few pages. Recover
+     * complete records until the first erased or CRC-invalid slot. This also
+     * lets logs made by the old per-page-checkpoint firmware continue past
+     * its 2,032-record header limit. */
+    while (!s_full && s_count < CAPACITY_RECORDS) {
+        log_record_t record;
+        result = S25FL128S_Read(RECORD_SLOT_ADDR(s_count),
+                                (uint8_t*)&record,
+                                RECORD_SIZE);
+        if (result != S25FL128S_OK) return LOG_ERR;
+        if (record_is_erased(&record)) break;
+        if (record.crc16 != log_crc16((const uint8_t*)&record,
+                                       RECORD_SIZE - CRC_SIZE)) {
+            /* A torn/non-erased record cannot safely be programmed again on
+             * NOR flash. Preserve the valid prefix and stop appending until
+             * the operator performs FORMAT. */
+            s_full = 1u;
+            break;
+        }
+
+        s_count++;
+        s_write_off += RECORD_SIZE;
+    }
+
+    if (s_count == CAPACITY_RECORDS) s_full = 1u;
     return result;
 }
 
 /* ---- FORMAT: the ONLY erase path (GIVEN — shows the discipline, spec R19) --*/
 int32_t log_format(void) {
     int32_t rc = LOG_OK;
-    flash_lock();
+    flash_lock_kind_t lock = flash_lock();
+    if (lock == FLASH_LOCK_INVALID) return LOG_ERR;
     /* Erase the header and all data sectors. Each erase blocks for up to
      * about 650 ms. That cost is the cause of the CONFIG-only,
      * operator-announced FORMAT command. */
     int32_t rc_header = LOG_OK;
     if (S25FL128S_EraseSector4K(HEADER_ADDR) != S25FL128S_OK) {
         rc_header = LOG_ERR;
+        rc = LOG_ERR;
     }
     for (uint32_t i = 0; rc_header == LOG_OK && i < DATA_SECTORS; i++) {
         if (S25FL128S_EraseSector64K(DATA_BASE + i * S25FL128S_SECTOR_64K) != S25FL128S_OK) {
             rc = LOG_ERR;
         }
     }
-    flash_unlock();
+    if (flash_unlock(lock) != osOK) rc = LOG_ERR;
 
     if (rc == LOG_OK) {
         s_write_off = 0u;
@@ -175,29 +330,10 @@ int32_t log_format(void) {
     }
 
     s_session_id++;
-    s_header_count = 0;
+    s_header_count    = 0u;
+    s_persisted_count = 0u;
 
-    log_header_t header = { .magic        = LOG_HDR_MAGIC,
-                            .session_id   = s_session_id,
-                            .write_off    = s_write_off,
-                            .record_count = s_count,
-                            .log_full     = s_full };
-    uint16_t     crc    = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
-    header.crc16        = crc;
-
-    flash_lock();
-    int32_t result = S25FL128S_PageProgram(HDR_SLOT_ADDR(s_header_count),
-                                           (const uint8_t*)&header,
-                                           HDR_SLOT_SIZE);
-    flash_unlock();
-
-    if (result != S25FL128S_OK) {
-        return LOG_ERR;
-    }
-
-    s_header_count++;
-
-    return rc;
+    return header_write_checkpoint();
 }
 
 int32_t log_flush() {
@@ -208,14 +344,10 @@ int32_t log_flush() {
         // s_overflow++;
         return LOG_FULL;
     }
-    if (s_header_count >= HDR_SLOT_COUNT) {
-        // goto cleanup_s_page_fill;
-        return LOG_HEADER_FULL;
-    }
-
-    flash_lock();
+    flash_lock_kind_t lock = flash_lock();
+    if (lock == FLASH_LOCK_INVALID) return LOG_ERR;
     int32_t result = S25FL128S_PageProgram(DATA_BASE + s_write_off, s_page, s_page_fill);
-    flash_unlock();
+    if (flash_unlock(lock) != osOK) return LOG_ERR;
 
     if (result != S25FL128S_OK) {
         return LOG_ERR;
@@ -229,25 +361,19 @@ int32_t log_flush() {
         s_full = 1;
     }
 
-    log_header_t header = { .magic        = LOG_HDR_MAGIC,
-                            .session_id   = s_session_id,
-                            .write_off    = s_write_off,
-                            .record_count = s_count,
-                            .log_full     = s_full };
-    uint16_t     crc    = log_crc16((const uint8_t*)&header, HEADER_SIZE - CRC_SIZE);
-    header.crc16        = crc;
-
-    flash_lock();
-    result = S25FL128S_PageProgram(HDR_SLOT_ADDR(s_header_count),
-                                   (const uint8_t*)&header,
-                                   HDR_SLOT_SIZE);
-    flash_unlock();
-
-    if (result != S25FL128S_OK) {
-        return LOG_ERR;
+    /* Keep the last header slot available for the persisted LOG FULL state.
+     * If an older firmware already consumed every slot, logging may still
+     * continue: boot recovery scans forward from its final checkpoint. */
+    uint8_t checkpoint_due =
+        (s_count - s_persisted_count) >= HDR_CHECKPOINT_RECORDS;
+    if (s_full || (checkpoint_due && s_header_count < (HDR_SLOT_COUNT - 1u))) {
+        int32_t header_result = header_write_checkpoint();
+        if (header_result != LOG_OK) {
+            /* A legacy log can arrive here with all header slots already used.
+             * Its data remains valid and boot scanning still finds the tail. */
+            if (header_result != LOG_HEADER_FULL) return header_result;
+        }
     }
-
-    s_header_count++;
 
     return LOG_OK;
 }
@@ -275,12 +401,6 @@ int32_t log_append(const log_record_t* rec) {
         s_overflow++;
         return LOG_FULL;
     }
-    if (s_header_count >= HDR_SLOT_COUNT) {
-        // goto cleanup_s_page_fill;
-        s_overflow++;
-        return LOG_HEADER_FULL;
-    }
-
     log_record_t record = *rec;
 
     uint16_t crc = log_crc16((const uint8_t*)&record, RECORD_SIZE - CRC_SIZE);
@@ -314,18 +434,7 @@ int32_t log_read_record(uint32_t index, log_record_t* out) {
      * Remember that DOWNLOAD reads in CHUNKS and releases the mutex between
      * them (spec R9). That release is what lets the logging continue during
      * a download. */
-    if (index >= s_count) {
-        return LOG_ERR;
-    }
-
-    int32_t result;
-    flash_lock();
-    result = S25FL128S_Read(RECORD_SLOT_ADDR(index), (uint8_t*)out, RECORD_SIZE);
-    flash_unlock();
-
-    if (result != S25FL128S_OK) {
-        return LOG_ERR;
-    }
+    if (log_read_records(index, 1u, out) != LOG_OK) return LOG_ERR;
 
     uint16_t crc = log_crc16((const uint8_t*)out, RECORD_SIZE - CRC_SIZE);
     if (crc != out->crc16) {
@@ -334,6 +443,24 @@ int32_t log_read_record(uint32_t index, log_record_t* out) {
     }
 
     return LOG_OK;
+}
+
+int32_t log_read_records(uint32_t first, uint32_t count, log_record_t* out) {
+    if (count == 0u) return LOG_OK;
+    if (out == NULL || count > LOG_DOWNLOAD_CHUNK_RECORDS || first >= s_count ||
+        count > (s_count - first)) {
+        return LOG_ERR;
+    }
+
+    flash_lock_kind_t lock = flash_lock();
+    if (lock == FLASH_LOCK_INVALID) return LOG_ERR;
+
+    int32_t result = S25FL128S_Read(RECORD_SLOT_ADDR(first),
+                                    (uint8_t*)out,
+                                    count * RECORD_SIZE);
+    if (flash_unlock(lock) != osOK) return LOG_ERR;
+
+    return result == S25FL128S_OK ? LOG_OK : LOG_ERR;
 }
 
 void log_store_status(log_status_t* out) {
